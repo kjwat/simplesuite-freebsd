@@ -54,7 +54,7 @@
 #ifdef __linux__
 # define _LINUX_SOURCE
 #endif
-#ifdef HAVE_SYS_RANDOM_H
+#if defined(HAVE_SYS_RANDOM_H) || defined(__FreeBSD__)
 # include <sys/random.h>
 #endif
 #ifdef __linux__

@@ -214,6 +214,9 @@ def run(binary):
                 try: return [json.loads(line) for line in (home / 'opened').read_text().splitlines()]
                 except FileNotFoundError: return []
             terminal.until(lambda: len(records()) >= n)
+            # The editor writes its record before exiting. Wait until search
+            # has restored cbreak mode before sending the next control key.
+            terminal.until(lambda: not (termios.tcgetattr(terminal.fd)[3] & termios.ICANON))
             return records()[-1]
 
         try:

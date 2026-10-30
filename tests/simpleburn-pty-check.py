@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import errno
 import fcntl
 import time
 
@@ -68,8 +69,11 @@ with tempfile.TemporaryDirectory(prefix='simpleburn-ui-') as directory:
                 output.extend(os.read(fd, 65536))
     try:
         expect(b'simpleburn')
+        # The ISO picker also prints the title. Wait for the complete drive
+        # screen before sending keys; curses startup may flush queued input.
+        expect(b'Up/Down choose', start=0)
         if sys.platform.startswith('linux'):
-            expect(b'Test Stick')
+            expect(b'Test Stick', start=0)
             assert b'System Disk' not in output
             os.write(fd, b'\n')
             expect(b'Erase ALL data')
@@ -86,7 +90,14 @@ with tempfile.TemporaryDirectory(prefix='simpleburn-ui-') as directory:
                 assert os.waitstatus_to_exitcode(status) == 0
                 break
             assert time.monotonic() < deadline
-            time.sleep(0.05)
+            # FreeBSD's smaller PTY output queue can block endwin() until
+            # the parent drains the final terminal restoration sequence.
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    output.extend(os.read(fd, 65536))
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
         assert not marker.exists(), 'the cancellation test must not authenticate'
     finally:
         try:

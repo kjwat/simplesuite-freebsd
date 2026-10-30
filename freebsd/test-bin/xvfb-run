@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Private Xvfb session for the native suite's headless GTK acceptance tests."""
+import argparse
+import getopt
+import os
+from pathlib import Path
+import secrets
+import select
+import shlex
+import subprocess
+import sys
+import tempfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('-a', '--auto-servernum', action='store_true')
+parser.add_argument('-s', '--server-args', default='-screen 0 1280x1024x24')
+parser.add_argument('command', nargs=argparse.REMAINDER)
+try:
+    options, command = getopt.getopt(sys.argv[1:], 'as:h', ['auto-servernum', 'server-args=', 'help'])
+except getopt.GetoptError as error:
+    parser.error(str(error))
+server_args = '-screen 0 1280x1024x24'
+for option, value in options:
+    if option in {'-h', '--help'}:
+        parser.print_help()
+        raise SystemExit(0)
+    if option in {'-s', '--server-args'}:
+        server_args = value
+if not command:
+    parser.error('a test command is required')
+
+with tempfile.TemporaryDirectory(prefix='simpleos-xvfb-') as temp:
+    auth = Path(temp) / 'Xauthority'
+    auth.touch(mode=0o600)
+    cookie = secrets.token_hex(16)
+    # Xorg loads the cookie's protocol/data independently of its display name.
+    # Seed authorization before the server opens its socket, then add the
+    # chosen display to the client's lookup file with that same cookie.
+    subprocess.run(['xauth', '-f', str(auth), 'add', ':0', '.', cookie], check=True)
+    # Xorg's displayfd chooses and locks a free display atomically.
+    read_fd, write_fd = os.pipe()
+    server = subprocess.Popen(['Xvfb', '-displayfd', str(write_fd), '-nolisten', 'tcp',
+                               '-auth', str(auth), *shlex.split(server_args)],
+                              pass_fds=(write_fd,), stdout=subprocess.DEVNULL)
+    os.close(write_fd)
+    try:
+        if not select.select([read_fd], [], [], 20)[0]:
+            raise RuntimeError('Xvfb did not become ready')
+        display = ':' + os.read(read_fd, 32).decode().strip()
+        if display == ':':
+            raise RuntimeError('Xvfb exited before selecting a display')
+        subprocess.run(['xauth', '-f', str(auth), 'add', display, '.', cookie], check=True)
+        result = subprocess.run(command, env=dict(os.environ, DISPLAY=display,
+                                                 XAUTHORITY=str(auth)))
+        raise SystemExit(result.returncode)
+    finally:
+        os.close(read_fd)
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()

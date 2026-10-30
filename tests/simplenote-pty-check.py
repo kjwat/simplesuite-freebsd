@@ -443,25 +443,33 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
     clipboard_dir.mkdir()
     for command in ("xclip", "wl-copy", "wl-paste"):
         helper = clipboard_dir / command
-        helper.write_text(
-            f"#!{sys.executable}\n"
-            "import os, sys, time\n"
-            "from pathlib import Path\n"
-            "if '-selection' in sys.argv:\n"
-            "    target = sys.argv[sys.argv.index('-selection') + 1]\n"
-            "else:\n"
-            "    target = 'primary' if '--primary' in sys.argv else 'clipboard'\n"
-            "path = Path(os.environ['SN_TEST_CLIP_DIR']) / target\n"
-            "if '-o' in sys.argv or Path(sys.argv[0]).name == 'wl-paste':\n"
-            "    if not path.exists(): sys.exit(1)\n"
-            "    sys.stdout.buffer.write(path.read_bytes())\n"
-            "    sys.exit(0)\n"
-            "if (path.parent / 'fail-copy').exists(): sys.exit(1)\n"
-            "if (path.parent / 'delay-copy').exists(): time.sleep(0.25)\n"
-            "tmp = path.with_name(path.name + '.' + str(os.getpid()))\n"
-            "tmp.write_bytes(sys.stdin.buffer.read())\n"
-            "os.replace(tmp, path)\n"
-        )
+        # Match the startup cost of the real native C clipboard tools. A
+        # Python interpreter in each helper can exceed the app's bounded copy
+        # handshake under TCG, letting a delayed mock overwrite a later paste.
+        helper.write_text("""#!/bin/sh
+set -eu
+target=clipboard
+reading=no
+[ "${0##*/}" != wl-paste ] || reading=yes
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -selection) target=$2; shift ;;
+        --primary) target=primary ;;
+        -o) reading=yes ;;
+    esac
+    shift
+done
+path=$SN_TEST_CLIP_DIR/$target
+if [ "$reading" = yes ]; then
+    [ -f "$path" ] || exit 1
+    exec cat "$path"
+fi
+[ ! -e "$SN_TEST_CLIP_DIR/fail-copy" ] || exit 1
+[ ! -e "$SN_TEST_CLIP_DIR/delay-copy" ] || sleep 0.25
+tmp=$path.$$
+cat > "$tmp"
+mv -f "$tmp" "$path"
+""")
         helper.chmod(0o755)
     for backend in ("x11", "wayland"):
         writing_notes = str(Path(fixture) / ("writing-" + backend))
@@ -499,7 +507,7 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             (clipboard_dir / "clipboard").write_text("External\r\nclipboard")
             terminal.send(b"\x19")
             terminal.send(b"\x18\x13")
-            assert records(writing_notes)[0]["text"] == expected + "External\nclipboard"
+            terminal.until(lambda: records(writing_notes)[0]["text"] == expected + "External\nclipboard")
             terminal.close()
             assert b"\x1b[?1004h" in terminal.output and b"\x1b[?1004l" in terminal.output
         finally:

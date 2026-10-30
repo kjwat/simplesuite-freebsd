@@ -16,7 +16,12 @@ LDFLAGS += -Wl,-rpath,/usr/local/lib/simpleos/libsidplayfp-2.12.0/lib
 endif
 endif
 PYTHON ?= python3
+ifeq ($(UNAME_S),FreeBSD)
+GCOV ?= llvm-cov gcov
+export PATH := $(CURDIR)/freebsd/test-bin:/usr/local/bin:/usr/local/sbin:$(PATH)
+else
 GCOV ?= gcov
+endif
 SIMPLESUITE_SOURCE_SHA ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf '%s' unknown)
 SIMPLESUITE_REQUIRE_CLEAN ?= 0
 SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
@@ -126,9 +131,18 @@ endif
 
 BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
 HELPER_BINARIES := $(FREEBSD_HELPERS:%=$(TARGET_PREFIX)%)
+.DEFAULT_GOAL := all
+export TERMINFO ?= $(abspath $(BUILD_DIR))/terminfo
+FREEBSD_TERMINFO := $(BUILD_DIR)/.freebsd-terminfo-ready
+$(BINARIES) $(TEST_TARGETS): | $(FREEBSD_TERMINFO)
+$(FREEBSD_TERMINFO): freebsd/terminfo.src | $(BUILD_DIR)
+	mkdir -p "$(BUILD_DIR)/terminfo"
+	/usr/local/bin/tic -x -o "$(BUILD_DIR)/terminfo" freebsd/terminfo.src
+	touch "$@"
+
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
-NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
+NCURSESW_LIBS := -L/usr/local/lib $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
 SIMPLEBURN_LIBS :=
 ifeq ($(UNAME_S),Darwin)
 SIMPLEBURN_LIBS := -framework CoreFoundation
@@ -294,7 +308,7 @@ test-simpleterm-install:
 # of the terminal suite, just like Simpleterm.
 SIMPLEPLAY_CORE_PACKAGES := gio-2.0 cairo libavformat libavcodec libavutil libavfilter libswscale libswresample sdl2 libass fluidsynth libsidplayfp json-glib-1.0
 SIMPLEPLAY_PACKAGES := gtk+-3.0 $(SIMPLEPLAY_CORE_PACKAGES)
-SIMPLEPLAY_SID_LIBS ?= $$( $(PKG_CONFIG) --libs libsidplayfp )
+SIMPLEPLAY_SID_LIBS ?= $(shell $(PKG_CONFIG) --variable=libdir libsidplayfp)/libsidplayfp.so
 ifeq ($(UNAME_S),Darwin)
 SIMPLEPLAY_CXX_LIBS := -lc++
 else
@@ -307,7 +321,7 @@ simpleplay-core: $(BUILD_DIR)/simpleplay-core
 
 $(BUILD_DIR)/simpleplay-synth.o: simpleplay-synth.cpp simpleplay-synth.h | $(BUILD_DIR)
 	$(PKG_CONFIG) --exists 'glib-2.0 >= 2.66' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_CORE_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the playback dependencies.' >&2; exit 1; }
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) -c simpleplay-synth.cpp -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -Wall -Wextra $$( $(PKG_CONFIG) --cflags libsidplayfp ) $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) -c simpleplay-synth.cpp -o $@
 
 $(BUILD_DIR)/simpleplay: simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
 	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the SimplePlay build dependencies.' >&2; exit 1; }
@@ -887,6 +901,10 @@ install: all $(SIMPLESUITE_ASSETS) SIMPLECHANGE.md $(SIMPLECHANGE_SCREENSHOTS) u
 
 # Copy only: the public install target finishes all compilation before sudo.
 install-payload:
+	mkdir -p "$(DESTDIR)$(DATADIR)/terminfo"
+	cp -R "$(BUILD_DIR)/terminfo/." "$(DESTDIR)$(DATADIR)/terminfo/"
+	mkdir -p "$(DESTDIR)$(SIMPLESUITE_DATADIR)/licenses"
+	cp freebsd/TERMINFO-COPYRIGHT.txt "$(DESTDIR)$(SIMPLESUITE_DATADIR)/licenses/TERMINFO-COPYRIGHT.txt"
 	mkdir -p $(DESTDIR)$(BINDIR)
 	set -e; while read short full extra; do \
 		case "$$short" in ''|'#'*) continue ;; *[!a-z0-9-]*) echo "Invalid short command in $(SIMPLESUITE_ABBREVIATIONS): $$short" >&2; exit 1 ;; esac; \
