@@ -1,0 +1,12108 @@
+// simplefiles.c
+// Build from the SimpleSuite directory with ./build.sh.
+
+#ifdef __FreeBSD__
+#define __BSD_VISIBLE 1
+#endif
+#define _GNU_SOURCE
+#define _XOPEN_SOURCE 700
+#define PANE_GAP 4
+
+#include <locale.h>
+#include <wchar.h>
+#include <wctype.h>
+#include <ncurses.h>
+#include <gio/gio.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#ifdef __FreeBSD__
+#include <ctype.h>
+#endif
+#include <sys/file.h>
+#include <time.h>
+#include <sys/statvfs.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#include <mntent.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#endif
+#if defined(__FreeBSD__) || defined(__APPLE__)
+#include <sys/mount.h>
+#endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
+#include <sys/mman.h>
+#include <poll.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
+#if defined(__APPLE__) && !defined(MAP_ANONYMOUS)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+#include "simpleproc.h"
+#include "simpleui.h"
+#include "simplefiles-udisks.h"
+#ifdef __APPLE__
+#include "simplefiles-macos.h"
+#endif
+
+
+#define SF_COL_GAP 3
+#define SF_PANE_GUTTER 2
+#define MAX_ENTRIES 4096
+#define MAX_SELECTED 4096
+#define MAX_CLIPBOARD 4096
+#define MAX_DIR_MEMORY 4096
+#define MAX_DRIVES 256
+#define DETAIL_REDRAW_DELAY_MS 50
+#define DIRECTORY_REFRESH_DELAY_MS 1000
+#define DIRECTORY_PREVIEW_CACHE_SIZE 128
+#define DIRECTORY_PREVIEW_CACHE_TTL_SEC 120
+#define DIRECTORY_PREVIEW_FAILURE_TTL_SEC 5
+#define DIRECTORY_PREVIEW_WARMUP_MS 10
+#define DIRECTORY_PREVIEW_SETTLE_MS (DETAIL_REDRAW_DELAY_MS - DIRECTORY_PREVIEW_WARMUP_MS)
+#define DIRECTORY_PREVIEW_PREFETCH_RADIUS 32
+#define DIRECTORY_PREVIEW_POLL_MS 10
+#define DIRECTORY_TYPE_CACHE_SIZE 8
+#define INITIAL_LIST_CAPACITY 64
+#define COPY_BUFFER_SIZE (1024U * 1024U)
+#define COPY_FILE_RANGE_CHUNK (64U * 1024U * 1024U)
+#define IMAGE_PREVIEW_CHANNELS 4
+#define IMAGE_PREVIEW_MAX_DIMENSION 2048
+#define IMAGE_PREVIEW_MAX_BYTES (64U * 1024U * 1024U)
+#define IMAGE_PREVIEW_KITTY_ID 1397115213U
+#define IMAGE_PREVIEW_SIXEL_PALETTE_SIZE 64
+#ifdef __FreeBSD__
+#define SIMPLEFILES_FREEBSD_UNMOUNT_HELPER "simplefiles-freebsd-unmount"
+#ifndef SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH
+#define SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH \
+    "/usr/local/libexec/simplefiles-freebsd-unmount"
+#endif
+#define SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST 64
+#define SIMPLEFILES_FREEBSD_UNMOUNT_REPAIR_FAILED 65
+#define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA 69
+#define SIMPLEFILES_FREEBSD_UNMOUNT_MOUNT_FAILED 71
+#define SIMPLEFILES_FREEBSD_UNMOUNT_CANT_CREATE 73
+#define SIMPLEFILES_FREEBSD_UNMOUNT_BUSY 75
+#define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED 77
+#define SIMPLEFILES_FREEBSD_UNMOUNT_CHECKER_MISSING 78
+#endif
+
+typedef enum {
+    ENTRY_FILESYSTEM = 0,
+    ENTRY_UNMOUNTED_DRIVE = 1
+} EntryKind;
+
+typedef struct {
+    char name[NAME_MAX + 1];
+    int is_dir;
+    EntryKind kind;
+    int drive_index;
+} Entry;
+
+typedef struct {
+    char id[PATH_MAX];
+    char name[NAME_MAX + 1];
+    char device[PATH_MAX];
+    char uuid[128];
+    char mount_path[PATH_MAX];
+#ifdef __FreeBSD__
+    /*
+     * The autofs key is an action identity, not a display name.  Labels may
+     * be sanitized by special_media, GIO names may not be labels at all, and
+     * two attached filesystems may have the same label.
+     */
+    char media_key[NAME_MAX + 1];
+#endif
+    int mounted;
+    int can_mount;
+    int removable;
+    GVolume *volume;
+} DriveRecord;
+
+static Entry entries[MAX_ENTRIES];
+static int entry_count = 0;
+static int cursor = 0;
+static int top = 0;
+static struct stat loaded_dir_stat;
+static int loaded_dir_stat_valid = 0;
+static DriveRecord drives[MAX_DRIVES];
+static int drive_count = 0;
+static GVolumeMonitor *volume_monitor = NULL;
+static GVolume *mounting_volume = NULL;
+static char mounting_drive_id[PATH_MAX] = "";
+static char mounting_drive_activity[64] = "";
+#ifdef __linux__
+static GCancellable *mounting_cancellable = NULL;
+static char mounting_device[PATH_MAX] = "";
+static int mounting_recovery_attempted = 0;
+#endif
+static int drive_state_dirty = 0;
+static char mounted_volume_path[PATH_MAX] = "";
+
+static char cwd_path[PATH_MAX];
+static int picker_mode = 0;
+static char picker_out[PATH_MAX] = "";
+
+static char (*selected)[PATH_MAX] = NULL;
+static int selected_count = 0;
+static int selected_capacity = 0;
+
+static char (*clipboard_paths)[PATH_MAX] = NULL;
+static int clipboard_count = 0;
+static int clipboard_capacity = 0;
+static int clipboard_mode = 0;
+static unsigned long clipboard_generation = 0;
+
+typedef struct {
+    int ok;
+    int fail;
+    int renamed;
+    int first_error;
+    char last_pasted_name[NAME_MAX + 1];
+} PasteResult;
+
+typedef struct {
+    volatile uint64_t done_bytes;
+    volatile uint64_t total_items;
+    volatile uint64_t done_items;
+    volatile int active;
+} PasteProgress;
+
+static PasteProgress *paste_progress = NULL;
+
+static pid_t paste_worker_pid = -1;
+static int paste_result_fd = -1;
+static int paste_worker_mode = 0;
+static unsigned long paste_clipboard_generation = 0;
+static char paste_destination[PATH_MAX] = "";
+
+typedef struct {
+    int ok;
+    int fail;
+} DeleteResult;
+
+typedef struct {
+    volatile uint64_t total_bytes;
+    volatile uint64_t done_bytes;
+    volatile uint64_t total_items;
+    volatile uint64_t done_items;
+    volatile int stage; /* 1 scanning, 2 moving */
+    volatile int active;
+} DeleteProgress;
+
+static DeleteProgress *delete_progress = NULL;
+static pid_t delete_worker_pid = -1;
+static int delete_result_fd = -1;
+
+typedef enum {
+    FILE_OPERATION_NONE = 0,
+    FILE_OPERATION_COMPRESS,
+    FILE_OPERATION_EXTRACT,
+    FILE_OPERATION_EMPTY_TRASH,
+    FILE_OPERATION_UNMOUNT
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    , FILE_OPERATION_MOUNT
+#endif
+} FileOperationKind;
+
+static pid_t file_operation_pid = -1;
+static FileOperationKind file_operation_kind = FILE_OPERATION_NONE;
+static char file_operation_directory[PATH_MAX] = "";
+static char file_operation_target[NAME_MAX + 1] = "";
+static char file_operation_drive_id[PATH_MAX] = "";
+#if defined(__FreeBSD__) || defined(__APPLE__)
+static char file_operation_path[PATH_MAX] = "";
+static char file_operation_device[PATH_MAX] = "";
+#endif
+
+static int pending_key = 0;
+static int pending_delete = 0;
+static int pending_permanent_delete = 0;
+static int pending_empty_trash = 0;
+static int show_hidden = 0;
+
+static int command_mode = 0;
+static char command[1024] = "";
+static int command_len = 0;
+static int command_cursor = 0;
+static int command_view_start = 0;
+static char command_entry_path[PATH_MAX] = "";
+
+static int search_mode = 0;
+static char search_query[1024] = "";
+static int search_len = 0;
+
+static int running = 1;
+static volatile sig_atomic_t stop_requested = 0;
+static const char *exit_reason = "normal";
+static FILE *debug_file = NULL;
+static int instance_lock_fd = -1;
+static char instance_lock_path[PATH_MAX] = "";
+
+static char message[256] = "";
+
+static int config_terminal_mode = 0;
+static char config_editor_command[512] = "";
+
+static char config_text_extensions[4096] =
+    ".txt,.md,.markdown,.tex,.c,.h,.cpp,.hpp,.cc,.py,.sh,.conf,.ini,.log";
+
+typedef struct {
+    char ext[64];
+    char cmd[512];
+} OpenRule;
+
+static OpenRule open_rules[256];
+static int open_rule_count = 0;
+
+static int config_preview = 1;
+static int config_preview_lines = 80;
+static uint64_t config_open_cache_max_bytes = UINT64_C(2) * 1024 * 1024 * 1024;
+static uint64_t config_open_cache_min_bytes = UINT64_C(16) * 1024 * 1024;
+
+/* Right pane: normal contents preview, or recursive information for the
+ * highlighted item.  Directory totals are calculated by a child process so
+ * browsing never waits on a large or slow tree. */
+static int info_mode = 0;
+
+typedef struct {
+    uint64_t bytes;
+    uint64_t files;
+    uint64_t dirs;
+    uint64_t errors;
+} InfoResult;
+
+static pid_t info_worker_pid = -1;
+static int info_result_fd = -1;
+static char info_worker_path[PATH_MAX] = "";
+static char info_ready_path[PATH_MAX] = "";
+static InfoResult info_result;
+static int info_result_ready = 0;
+
+/* Directory previews may require a network directory read.  Keep that work
+ * out of the curses thread so a slow NFS server can never freeze navigation. */
+static pid_t directory_preview_worker_pid = -1;
+static int directory_preview_result_fd = -1;
+static char directory_preview_worker_path[PATH_MAX] = "";
+static int directory_preview_worker_rows = 0;
+static int directory_preview_changed_entry = -1;
+
+typedef struct {
+    int index;
+    int is_dir;
+} DirectoryTypeResult;
+
+typedef struct {
+    char name[NAME_MAX + 1];
+    int is_dir;
+} DirectoryTypeCacheItem;
+
+typedef struct {
+    char path[PATH_MAX];
+    struct stat directory_stat;
+    DirectoryTypeCacheItem *items;
+    int count;
+    uint64_t last_used;
+} DirectoryTypeCacheEntry;
+
+/* One child resolves every DT_UNKNOWN row from a newly loaded directory.
+ * This restores the old slash markers and directory-first ordering without
+ * putting an NFS metadata sweep on the curses thread. */
+static pid_t directory_type_worker_pid = -1;
+static int directory_type_result_fd = -1;
+static char directory_type_worker_path[PATH_MAX] = "";
+static unsigned long directory_listing_generation = 0;
+static unsigned long directory_type_worker_generation = 0;
+static DirectoryTypeCacheEntry
+    directory_type_cache[DIRECTORY_TYPE_CACHE_SIZE];
+static uint64_t directory_type_cache_clock = 0;
+
+typedef struct {
+    char path[PATH_MAX];
+    int rows;
+    char *text;
+    int result;
+    struct timespec ready_time;
+    uint64_t last_used;
+} DirectoryPreviewCacheEntry;
+
+static DirectoryPreviewCacheEntry
+    directory_preview_cache[DIRECTORY_PREVIEW_CACHE_SIZE];
+static uint64_t directory_preview_cache_clock = 0;
+
+enum {
+    DIRECTORY_PREVIEW_NONE = 0,
+    DIRECTORY_PREVIEW_DIRECTORY,
+    DIRECTORY_PREVIEW_NOT_DIRECTORY,
+    DIRECTORY_PREVIEW_FAILED
+};
+
+/* Filesystem capacity can require a network statfs RPC.  Never perform it
+ * from the curses drawing path: NFS servers may take seconds to answer. */
+typedef struct {
+    int ok;
+    struct statvfs vfs;
+} CapacityResult;
+
+static pid_t capacity_worker_pid = -1;
+static int capacity_result_fd = -1;
+static char capacity_worker_path[PATH_MAX] = "";
+static char capacity_ready_path[PATH_MAX] = "";
+static struct statvfs capacity_ready_vfs;
+static int capacity_ready_valid = 0;
+static struct timespec capacity_ready_time;
+
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    time_t modified;
+    long modified_nsec;
+    time_t changed;
+    long changed_nsec;
+} ImageFileStamp;
+
+typedef enum {
+    TERMINAL_GRAPHICS_NONE = 0,
+    TERMINAL_GRAPHICS_KITTY,
+    TERMINAL_GRAPHICS_SIXEL,
+    TERMINAL_GRAPHICS_ITERM
+} TerminalGraphicsProtocol;
+
+typedef enum {
+    IMAGE_DATA_RGBA = 0,
+    IMAGE_DATA_PNG
+} ImageDataFormat;
+
+/* Image decoding is delegated to FFmpeg in a child process.  The child writes
+ * pane-sized RGBA or PNG data to an anonymous temporary file, which keeps slow
+ * or malformed images from blocking navigation and avoids pipe-capacity
+ * stalls. */
+static pid_t image_worker_pid = -1;
+static int image_result_fd = -1;
+static char image_worker_path[PATH_MAX] = "";
+static int image_worker_width = 0;
+static int image_worker_height = 0;
+static ImageDataFormat image_worker_format = IMAGE_DATA_RGBA;
+static ImageFileStamp image_worker_stamp;
+
+/* Preview workers are disposable and must never hold navigation hostage.
+ * Keep cancelled children on a small reap list instead of synchronously
+ * waiting for a filesystem read or decoder to unwind. */
+static pid_t *cancelled_worker_pids = NULL;
+static size_t cancelled_worker_count = 0;
+static size_t cancelled_worker_capacity = 0;
+
+static unsigned char *image_ready_pixels = NULL;
+static size_t image_ready_bytes = 0;
+static char image_ready_path[PATH_MAX] = "";
+static int image_ready_width = 0;
+static int image_ready_height = 0;
+static ImageDataFormat image_ready_format = IMAGE_DATA_RGBA;
+static ImageFileStamp image_ready_stamp;
+static unsigned long image_ready_generation = 0;
+
+static char image_failed_path[PATH_MAX] = "";
+static int image_failed_width = 0;
+static int image_failed_height = 0;
+static ImageFileStamp image_failed_stamp;
+
+static TerminalGraphicsProtocol terminal_graphics_protocol =
+    TERMINAL_GRAPHICS_NONE;
+static int image_overlay_requested = 0;
+static unsigned long image_overlay_requested_generation = 0;
+static int image_overlay_requested_columns = 0;
+static int image_overlay_requested_rows = 0;
+static unsigned long image_overlay_active_generation = 0;
+
+static char config_trash_dir[PATH_MAX] = "";
+static int config_confirm_delete = 1;
+
+static WINDOW *parent_win = NULL;
+static WINDOW *current_win = NULL;
+static WINDOW *preview_win = NULL;
+static WINDOW *top_win = NULL;
+static WINDOW *status_win = NULL;
+
+static int last_lines = 0;
+static int last_cols = 0;
+
+static int single_pane_mode = 0;
+static int preview_pane_visible = 1;
+
+typedef struct {
+    char dir[PATH_MAX];
+    char child[NAME_MAX + 1];
+} DirMemory;
+
+static DirMemory *dir_memory = NULL;
+static int dir_memory_count = 0;
+static int dir_memory_capacity = 0;
+
+static int remove_recursive(const char *path);
+static int mkdir_p(const char *path);
+static void join_path(char *out, const char *a, const char *b);
+static void load_dir(const char *path);
+static int current_entry_is_dir(void);
+#ifdef __FreeBSD__
+static int recover_to_existing_parent(const char *path);
+#endif
+static void draw_ui(void);
+static void destroy_windows(void);
+static void clear_selected(void);
+static void arm_delete(void);
+static void confirm_delete(void);
+static void confirm_permanent_delete(void);
+static void expand_path(char *out, const char *in);
+static void expand_config_path(char *out, const char *in);
+static void trim_config_value(char *s);
+static void cancel_info_worker(void);
+static int check_background_info(void);
+static void cancel_directory_type_worker(void);
+static int start_directory_type_worker(const char *path);
+static int check_background_directory_types(void);
+static int directory_type_cache_apply(const char *path,
+                                      const struct stat *directory_stat,
+                                      Entry *target, int count);
+static void clear_directory_type_cache(void);
+static void cancel_directory_preview_worker(void);
+static int check_background_directory_preview(void);
+static int directory_preview_cached_type(const char *path, int *is_dir);
+static void cancel_capacity_worker(void);
+static int check_background_capacity(void);
+static void request_capacity_refresh(const char *path);
+static void cancel_worker_without_waiting(pid_t pid);
+static int image_temporary_fd(void);
+static void cancel_image_worker(void);
+static void cancel_media_workers_for_unmount(void);
+static int check_background_image(void);
+static void abandon_image_overlay(void);
+static void clear_active_image_overlay(void);
+static void dismiss_image_overlay(void);
+static void mode_string(mode_t mode, char *out);
+static void human_size(long long bytes, char *out, size_t outsz);
+static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
+static int file_operation_can_start(void);
+static void redirect_background_stdio(void);
+static pid_t network_ui_pid;
+static int path_is_simpleserve_file(const char *path);
+static int network_ui_path(const char *path);
+static int network_change_directory(const char *path);
+static int network_directory_entries(const char *path, Entry *target, int capacity);
+static int browsing_stat(const char *path, struct stat *st);
+static int browsing_lstat(const char *path, struct stat *st);
+static int browsing_statvfs(const char *path, struct statvfs *st);
+static void remember_file_operation(pid_t pid, FileOperationKind kind,
+                                    const char *directory,
+                                    const char *target);
+#ifdef __FreeBSD__
+static int same_device_path(const char *a, const char *b);
+#endif
+#ifdef __FreeBSD__
+#define FREEBSD_LOOKUP_CACHE_MAX 512
+typedef struct {
+    char key[PATH_MAX];
+    char value[PATH_MAX];
+    int found;
+} FreeBSDLookupCacheEntry;
+
+static FreeBSDLookupCacheEntry freebsd_fstyp_label_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_fstyp_label_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_exact_media_map_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_exact_media_map_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_media_map_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_media_map_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_geom_provider_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_geom_provider_cache_count = 0;
+static int freebsd_geom_provider_cache_loaded = 0;
+static int freebsd_geom_provider_cache_valid = 0;
+#endif
+
+#ifdef __FreeBSD__
+static void freebsd_clear_media_lookup_cache(void);
+static int freebsd_resolve_media_alias(char *out, size_t outsz,
+                                       const char *requested);
+static int freebsd_should_hide_media_entry(const char *dir_path,
+                                           const char *name);
+static int freebsd_media_entry_is_mounted(const char *dir_path,
+                                          const char *name);
+static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
+                                                const char *name);
+static int freebsd_media_entry_should_avoid_io(const char *dir_path,
+                                               const char *name,
+                                               char *device,
+                                               size_t devicesz);
+static int freebsd_display_media_path(char *out, size_t outsz,
+                                      const char *path);
+static int freebsd_capture_fstyp_label(const char *device, char *label,
+                                       size_t labelsz);
+static int freebsd_media_key_for_label(char *out, size_t outsz,
+                                       const char *label);
+static int freebsd_media_mount_component(const char *mountpoint,
+                                         const char **component);
+static int freebsd_build_media_entries(Entry *target, int capacity,
+                                       const char *context);
+static int freebsd_start_media_mount(const char *path, const char *device,
+                                     const char *drive_id,
+                                     const char *display_name);
+static void set_freebsd_mount_failure_message(int exit_code);
+#endif
+
+static void request_stop(int signo) {
+    (void)signo;
+    stop_requested = 1;
+}
+
+static int install_signal_handlers(void) {
+    struct sigaction sa;
+    int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = request_stop;
+    sigemptyset(&sa.sa_mask);
+
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+        if (sigaction(signals[i], &sa, NULL) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int safe_copy(char *dst, size_t dstsz, const char *src) {
+    size_t n;
+
+    if (!dst || dstsz == 0)
+        return 0;
+    if (!src)
+        src = "";
+
+    n = strlen(src);
+    if (n >= dstsz)
+        n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return src[n] == '\0';
+}
+
+static int safe_join3(char *dst, size_t dstsz, const char *a, const char *sep, const char *b) {
+    size_t alen, slen, blen, total;
+
+    if (!dst || dstsz == 0)
+        return 0;
+    if (!a) a = "";
+    if (!sep) sep = "";
+    if (!b) b = "";
+
+    alen = strlen(a);
+    slen = strlen(sep);
+    blen = strlen(b);
+    total = alen + slen + blen;
+    if (total >= dstsz) {
+        dst[0] = '\0';
+        return 0;
+    }
+
+    memcpy(dst, a, alen);
+    memcpy(dst + alen, sep, slen);
+    memcpy(dst + alen + slen, b, blen);
+    dst[total] = '\0';
+    return 1;
+}
+
+
+static int grow_int_capacity(int current, int needed, int max) {
+    int next = current > 0 ? current : INITIAL_LIST_CAPACITY;
+
+    while (next < needed && next < max) {
+        if (next > max / 2) {
+            next = max;
+            break;
+        }
+        next *= 2;
+    }
+
+    return next;
+}
+
+static int ensure_selected_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= selected_capacity)
+        return 1;
+    if (needed > MAX_SELECTED)
+        return 0;
+
+    next = grow_int_capacity(selected_capacity, needed, MAX_SELECTED);
+    grown = realloc(selected, (size_t)next * sizeof(*selected));
+    if (!grown)
+        return 0;
+
+    selected = grown;
+    selected_capacity = next;
+    return 1;
+}
+
+static int ensure_clipboard_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= clipboard_capacity)
+        return 1;
+    if (needed > MAX_CLIPBOARD)
+        return 0;
+
+    next = grow_int_capacity(clipboard_capacity, needed, MAX_CLIPBOARD);
+    grown = realloc(clipboard_paths, (size_t)next * sizeof(*clipboard_paths));
+    if (!grown)
+        return 0;
+
+    clipboard_paths = grown;
+    clipboard_capacity = next;
+    return 1;
+}
+
+static int ensure_dir_memory_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= dir_memory_capacity)
+        return 1;
+    if (needed > MAX_DIR_MEMORY)
+        return 0;
+
+    next = grow_int_capacity(dir_memory_capacity, needed, MAX_DIR_MEMORY);
+    grown = realloc(dir_memory, (size_t)next * sizeof(*dir_memory));
+    if (!grown)
+        return 0;
+
+    dir_memory = grown;
+    dir_memory_capacity = next;
+    return 1;
+}
+
+
+static int append_file_for_migration(const char *src, const char *dst) {
+    struct stat st;
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+
+    if (!src || !dst || !*src || !*dst)
+        return 0;
+    if (stat(src, &st) != 0 || !S_ISREG(st.st_mode))
+        return 0;
+
+    in = fopen(src, "rb");
+    if (!in)
+        return 0;
+    out = fopen(dst, "ab");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    if (stat(dst, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+        fputc('\n', out);
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in))
+        ok = 0;
+    fclose(in);
+    if (fclose(out) != 0)
+        ok = 0;
+
+    if (ok)
+        unlink(src);
+    return ok;
+}
+
+static void migrate_legacy_debug_log(const char *new_path) {
+    static int attempted = 0;
+    const char *home = getenv("HOME");
+    char old_path[PATH_MAX];
+
+    if (attempted)
+        return;
+    attempted = 1;
+
+    if (!home || !*home || !new_path || !*new_path)
+        return;
+    if (snprintf(old_path, sizeof(old_path), "%s/.cache/simplefiles/debug.log", home) >= (int)sizeof(old_path))
+        return;
+
+    append_file_for_migration(old_path, new_path);
+}
+
+static int runtime_dir(char *out, size_t outsz) {
+    const char *home = getenv("HOME");
+
+    if (!home || !home[0])
+        return 0;
+    if (snprintf(out, outsz, "%s/.local/state/simplefiles", home) >= (int)outsz)
+        return 0;
+    if (mkdir_p(out) != 0)
+        return 0;
+    return 1;
+}
+
+static void debug_log(const char *fmt, ...) {
+    va_list ap;
+
+    if (!debug_file)
+        return;
+    va_start(ap, fmt);
+    vfprintf(debug_file, fmt, ap);
+    va_end(ap);
+    fputc('\n', debug_file);
+    fflush(debug_file);
+}
+
+static void start_debug_log(const char *argv0) {
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+    char exe[PATH_MAX] = "unknown";
+    char here[PATH_MAX] = "unknown";
+    const char *debug = getenv("SIMPLEFILES_DEBUG");
+    const char *tty = ttyname(STDIN_FILENO);
+    ssize_t n;
+
+    if (!debug || strcmp(debug, "1") != 0 || !runtime_dir(dir, sizeof(dir)))
+        return;
+    if (!safe_join3(path, sizeof(path), dir, "/", "debug.log"))
+        return;
+    migrate_legacy_debug_log(path);
+    debug_file = fopen(path, "a");
+    if (!debug_file)
+        return;
+    fcntl(fileno(debug_file), F_SETFD, FD_CLOEXEC);
+
+#ifdef __FreeBSD__
+    size_t exe_size = sizeof(exe);
+    int mib[4] = {
+        CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid()
+    };
+    if (sysctl(mib, 4, exe, &exe_size, NULL, 0) == 0 &&
+        exe_size > 0) {
+        exe[sizeof(exe) - 1] = '\0';
+        n = (ssize_t)strlen(exe);
+    } else {
+        n = -1;
+    }
+#elif defined(__APPLE__)
+    {
+        uint32_t exe_size = (uint32_t)sizeof(exe);
+
+        if (_NSGetExecutablePath(exe, &exe_size) == 0 && exe[0] == '/')
+            n = (ssize_t)strlen(exe);
+        else
+            n = -1;
+    }
+#else
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
+    if (n >= 0)
+        exe[n] = '\0';
+    if (!getcwd(here, sizeof(here)))
+        snprintf(here, sizeof(here), "unknown");
+    debug_log("start pid=%ld ppid=%ld tty=%s cwd=%s argv0=%s exe=%s",
+              (long)getpid(), (long)getppid(), tty ? tty : "none", here,
+              argv0 ? argv0 : "", exe);
+}
+
+static int acquire_instance_lock(void) {
+    char dir[PATH_MAX];
+    struct stat st;
+
+    if (!runtime_dir(dir, sizeof(dir)) || fstat(STDIN_FILENO, &st) != 0)
+        return 0;
+    if (snprintf(instance_lock_path, sizeof(instance_lock_path),
+                 "%s/tty-%ju-%ju.lock", dir,
+                 (uintmax_t)st.st_dev, (uintmax_t)st.st_ino) >= (int)sizeof(instance_lock_path))
+        return 0;
+    instance_lock_fd = open(instance_lock_path, O_RDWR | O_CREAT, 0600);
+    if (instance_lock_fd < 0)
+        return 0;
+    fcntl(instance_lock_fd, F_SETFD, FD_CLOEXEC);
+    if (flock(instance_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        close(instance_lock_fd);
+        instance_lock_fd = -1;
+        return -1;
+    }
+    return 1;
+}
+
+static void release_instance_lock(void) {
+    if (instance_lock_fd < 0)
+        return;
+    unlink(instance_lock_path);
+    flock(instance_lock_fd, LOCK_UN);
+    close(instance_lock_fd);
+    instance_lock_fd = -1;
+}
+
+static int terminal_is_available(void) {
+    pid_t foreground;
+
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+        return 0;
+    errno = 0;
+    foreground = tcgetpgrp(STDIN_FILENO);
+    if (foreground < 0 &&
+        (errno == ENOTTY || errno == EIO || errno == EBADF))
+        return 0;
+    return 1;
+}
+
+static int startup_chdir_resolved(const char *path) {
+    char resolved[PATH_MAX];
+    char requested[PATH_MAX];
+    struct stat st;
+
+    if (!path || !*path)
+        return 0;
+    if (network_ui_path(path))
+        return network_change_directory(path);
+    if (path[0] != '/' && cwd_path[0]) {
+        join_path(requested, cwd_path, path);
+        if (network_ui_path(requested))
+            return network_change_directory(requested);
+    }
+    if (!realpath(path, resolved))
+        return 0;
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode))
+        return 0;
+    if (chdir(resolved) != 0)
+        return 0;
+
+    safe_copy(cwd_path, sizeof(cwd_path), resolved);
+    return 1;
+}
+
+static void startup_use_cwd_or_home(void) {
+    const char *home;
+
+    if (getcwd(cwd_path, sizeof(cwd_path)))
+        return;
+
+    home = getenv("HOME");
+    if (startup_chdir_resolved(home))
+        return;
+    if (startup_chdir_resolved("/"))
+        return;
+
+    safe_copy(cwd_path, sizeof(cwd_path), "/");
+}
+
+static int startup_set_directory(const char *argv_path) {
+    startup_use_cwd_or_home();
+    if (argv_path && *argv_path)
+        return startup_chdir_resolved(argv_path);
+    return 1;
+}
+
+
+static void hard_redraw_after_shell(void) {
+    clear_active_image_overlay();
+    abandon_image_overlay();
+    reset_prog_mode();
+
+    destroy_windows();
+    last_lines = 0;
+    last_cols = 0;
+
+    clear();
+    erase();
+    refresh();
+    clearok(stdscr, TRUE);
+
+    load_dir(cwd_path);
+    draw_ui();
+}
+
+static int wait_for_child(pid_t pid, int *status, const char *context) {
+    pid_t result;
+
+    debug_log("%s parent entering waitpid child=%ld", context, (long)pid);
+    for (;;) {
+        if (stop_requested) {
+            exit_reason = "signal";
+            running = 0;
+            debug_log("%s waitpid interrupted by stop request", context);
+            return 0;
+        }
+
+        result = waitpid(pid, status, 0);
+        if (result == pid) {
+            debug_log("%s waitpid returned child=%ld status=%d",
+                      context, (long)pid, status ? *status : 0);
+            return 1;
+        }
+        if (result < 0 && errno == EINTR)
+            continue;
+
+        debug_log("%s waitpid failed child=%ld errno=%d",
+                  context, (long)pid, errno);
+        return -1;
+    }
+}
+
+static int redraw_after_child(const char *context) {
+    int tty_valid = terminal_is_available();
+
+    debug_log("%s tty valid before redraw=%d stop_requested=%d",
+              context, tty_valid, stop_requested ? 1 : 0);
+    if (stop_requested) {
+        exit_reason = "signal";
+        running = 0;
+        return 0;
+    }
+    if (!tty_valid) {
+        exit_reason = "lost tty";
+        running = 0;
+        return 0;
+    }
+
+    debug_log("%s before hard_redraw_after_shell", context);
+    hard_redraw_after_shell();
+    debug_log("%s after hard_redraw_after_shell", context);
+    return 1;
+}
+
+
+
+static void set_cursor_to_name(const char *name) {
+    for (int i = 0; i < entry_count; i++) {
+        if (strcmp(entries[i].name, name) == 0) {
+            cursor = i;
+            top = cursor - 5;
+            if (top < 0) top = 0;
+            return;
+        }
+    }
+}
+
+static void remember_dir_child(const char *dir, const char *child) {
+    if (!dir || !child || dir[0] == '\0' || child[0] == '\0')
+        return;
+
+    for (int i = 0; i < dir_memory_count; i++) {
+        if (strcmp(dir_memory[i].dir, dir) == 0) {
+            safe_copy(dir_memory[i].child, sizeof(dir_memory[i].child), child);
+            return;
+        }
+    }
+
+    if (dir_memory_count < MAX_DIR_MEMORY && ensure_dir_memory_capacity(dir_memory_count + 1)) {
+        safe_copy(dir_memory[dir_memory_count].dir, sizeof(dir_memory[dir_memory_count].dir), dir);
+
+        safe_copy(dir_memory[dir_memory_count].child, sizeof(dir_memory[dir_memory_count].child), child);
+
+        dir_memory_count++;
+    }
+}
+
+static void remember_current_cursor(void) {
+    if (entry_count <= 0)
+        return;
+
+    remember_dir_child(cwd_path, entries[cursor].name);
+}
+
+static int restore_dir_cursor(const char *dir) {
+    for (int i = 0; i < dir_memory_count; i++) {
+        if (strcmp(dir_memory[i].dir, dir) == 0) {
+            set_cursor_to_name(dir_memory[i].child);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int cmp_entries(const void *a, const void *b) {
+    const Entry *ea = a;
+    const Entry *eb = b;
+    int ea_dir = ea->is_dir == 1;
+    int eb_dir = eb->is_dir == 1;
+
+    if (ea_dir != eb_dir)
+        return eb_dir - ea_dir;
+
+    return strcasecmp(ea->name, eb->name);
+}
+
+static void set_message(const char *msg) {
+    strncpy(message, msg, sizeof(message) - 1);
+    message[sizeof(message) - 1] = '\0';
+}
+
+static void join_path(char *out, const char *a, const char *b) {
+    if (strcmp(a, "/") == 0) {
+        if (!safe_join3(out, PATH_MAX, "/", "", b))
+            out[0] = '\0';
+    } else {
+        if (!safe_join3(out, PATH_MAX, a, "/", b))
+            out[0] = '\0';
+    }
+}
+
+static const char *base_name(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static int path_exists(const char *path) {
+    struct stat st;
+    return lstat(path, &st) == 0;
+}
+
+static int path_is_regular(const char *path) {
+    struct stat st;
+    return browsing_stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+
+static int entry_is_unmounted_drive(const Entry *entry) {
+    return entry && entry->kind == ENTRY_UNMOUNTED_DRIVE;
+}
+
+static DriveRecord *entry_drive_record(const Entry *entry) {
+    if (!entry_is_unmounted_drive(entry) || entry->drive_index < 0 ||
+        entry->drive_index >= drive_count)
+        return NULL;
+    return &drives[entry->drive_index];
+}
+
+static void clear_drive_snapshot(void) {
+    for (int i = 0; i < drive_count; i++)
+        g_clear_object(&drives[i].volume);
+    memset(drives, 0, sizeof(drives));
+    drive_count = 0;
+}
+
+static int cmp_drive_records(const void *a, const void *b) {
+    const DriveRecord *da = a;
+    const DriveRecord *db = b;
+    return strcmp(da->id, db->id);
+}
+
+#ifndef __APPLE__
+static int volume_is_local_removable(GVolume *volume, const char *device,
+                                     const char *class_id, GDrive *drive,
+                                     char *reason, size_t reason_size) {
+    int volume_can_eject;
+    int drive_can_eject = 0;
+    int drive_can_stop = 0;
+    int drive_removable = 0;
+
+    if (!volume || !device || strncmp(device, "/dev/", 5) != 0) {
+        snprintf(reason, reason_size, "unix-device-is-not-local");
+        return 0;
+    }
+    if (!class_id || strcmp(class_id, "device") != 0) {
+        snprintf(reason, reason_size, "volume-class-is-not-device");
+        return 0;
+    }
+
+    volume_can_eject = g_volume_can_eject(volume);
+    if (drive) {
+        drive_can_eject = g_drive_can_eject(drive);
+        drive_can_stop = g_drive_can_stop(drive);
+        drive_removable = g_drive_is_removable(drive);
+    }
+
+    if (volume_can_eject || drive_can_eject || drive_can_stop ||
+        drive_removable) {
+        snprintf(reason, reason_size, "%s",
+                 volume_can_eject ? "volume-can-eject" :
+                 drive_can_eject ? "drive-can-eject" :
+                 drive_can_stop ? "drive-can-stop" :
+                                  "drive-is-removable");
+        return 1;
+    }
+
+    snprintf(reason, reason_size, "no-positive-removable-evidence");
+    return 0;
+}
+#endif
+
+static int drive_id_exists(const char *id) {
+    for (int i = 0; i < drive_count; i++) {
+        if (strcmp(drives[i].id, id) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+#ifdef __APPLE__
+static int cmp_macos_volumes(const void *left, const void *right) {
+    const SimpleFilesMacVolume *a = left;
+    const SimpleFilesMacVolume *b = right;
+
+    return strcmp(a->id, b->id);
+}
+
+static int macos_drive_snapshot_changed(void) {
+    SimpleFilesMacVolume volumes[MAX_DRIVES];
+    int count = simplefiles_macos_list_volumes(volumes, MAX_DRIVES);
+
+    qsort(volumes, (size_t)count, sizeof(volumes[0]), cmp_macos_volumes);
+    if (count != drive_count)
+        return 1;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(volumes[i].id, drives[i].id) ||
+            strcmp(volumes[i].name, drives[i].name) ||
+            strcmp(volumes[i].device, drives[i].device) ||
+            strcmp(volumes[i].mount_path, drives[i].mount_path) ||
+            volumes[i].mounted != drives[i].mounted ||
+            volumes[i].can_mount != drives[i].can_mount)
+            return 1;
+    }
+    return 0;
+}
+#endif
+
+/* GIO is the sole discovery source.  Directory listings consume this cached
+ * snapshot; drawing a pane never talks to the volume monitor itself. */
+static void refresh_drive_snapshot(void) {
+#ifdef __APPLE__
+    SimpleFilesMacVolume volumes[MAX_DRIVES];
+    int count;
+
+    clear_drive_snapshot();
+    drive_state_dirty = 0;
+    count = simplefiles_macos_list_volumes(volumes, MAX_DRIVES);
+    for (int i = 0; i < count && drive_count < MAX_DRIVES; i++) {
+        SimpleFilesMacVolume *volume = &volumes[i];
+        DriveRecord *record;
+
+        if (!volume->removable || !volume->id[0] || !volume->name[0] ||
+            !volume->device[0] || drive_id_exists(volume->id))
+            continue;
+        record = &drives[drive_count++];
+        safe_copy(record->id, sizeof(record->id), volume->id);
+        safe_copy(record->name, sizeof(record->name), volume->name);
+        safe_copy(record->device, sizeof(record->device), volume->device);
+        safe_copy(record->uuid, sizeof(record->uuid), volume->uuid);
+        safe_copy(record->mount_path, sizeof(record->mount_path),
+                  volume->mount_path);
+        record->mounted = volume->mounted;
+        record->can_mount = volume->can_mount;
+        record->removable = 1;
+        record->volume = NULL;
+        debug_log("macOS drive snapshot name=\"%s\" id=\"%s\" "
+                  "device=\"%s\" mount=\"%s\" can_mount=%d",
+                  record->name, record->id, record->device,
+                  record->mount_path, record->can_mount);
+    }
+    qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
+          cmp_drive_records);
+    debug_log("macOS drive snapshot ready count=%d", drive_count);
+#else
+    GList *volumes;
+
+    clear_drive_snapshot();
+    drive_state_dirty = 0;
+    if (!volume_monitor) {
+        debug_log("drive snapshot unavailable: no volume monitor");
+        return;
+    }
+
+    volumes = g_volume_monitor_get_volumes(volume_monitor);
+    for (GList *link = volumes; link && drive_count < MAX_DRIVES;
+         link = link->next) {
+        GVolume *volume = G_VOLUME(link->data);
+        GMount *mount = g_volume_get_mount(volume);
+        GFile *mount_root = mount ? g_mount_get_default_location(mount) : NULL;
+        GDrive *drive = g_volume_get_drive(volume);
+        char *name = g_volume_get_name(volume);
+        char *uuid = g_volume_get_uuid(volume);
+        char *device = g_volume_get_identifier(
+            volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+        char *class_id = g_volume_get_identifier(
+            volume, G_VOLUME_IDENTIFIER_KIND_CLASS);
+#ifdef __FreeBSD__
+        char *filesystem_label = g_volume_get_identifier(
+            volume, G_VOLUME_IDENTIFIER_KIND_LABEL);
+#endif
+        char *mount_path = mount_root ? g_file_get_path(mount_root) : NULL;
+#ifdef __FreeBSD__
+        const char *display_name =
+            filesystem_label && filesystem_label[0] ?
+                filesystem_label : name;
+#endif
+        char reason[96];
+        char id[PATH_MAX];
+        int removable = volume_is_local_removable(
+            volume, device, class_id, drive, reason, sizeof(reason));
+
+        id[0] = '\0';
+        if (uuid && uuid[0])
+            safe_join3(id, sizeof(id), "uuid:", "", uuid);
+        else if (device && device[0])
+            safe_join3(id, sizeof(id), "device:", "", device);
+
+        debug_log("drive snapshot candidate name=\"%s\" id=\"%s\" "
+                  "device=\"%s\" class=\"%s\" mount=\"%s\" "
+                  "can_mount=%d removable=%d reason=\"%s\"",
+                  name ? name : "", id, device ? device : "",
+                  class_id ? class_id : "", mount_path ? mount_path : "",
+                  g_volume_can_mount(volume), removable, reason);
+
+#ifdef __FreeBSD__
+        if (removable && display_name && display_name[0] && id[0] &&
+            !drive_id_exists(id)) {
+#else
+        if (removable && name && name[0] && id[0] &&
+            !drive_id_exists(id)) {
+#endif
+            DriveRecord *record = &drives[drive_count++];
+            safe_copy(record->id, sizeof(record->id), id);
+#ifdef __FreeBSD__
+            safe_copy(record->name, sizeof(record->name), display_name);
+            if (filesystem_label && filesystem_label[0] &&
+                freebsd_media_key_for_label(record->media_key,
+                                            sizeof(record->media_key),
+                                            filesystem_label)) {
+                /* special_media applies this exact label sanitization. */
+            } else {
+                safe_copy(record->media_key, sizeof(record->media_key),
+                          base_name(device));
+            }
+#else
+            safe_copy(record->name, sizeof(record->name), name);
+#endif
+            safe_copy(record->device, sizeof(record->device), device);
+            safe_copy(record->uuid, sizeof(record->uuid), uuid ? uuid : "");
+            safe_copy(record->mount_path, sizeof(record->mount_path),
+                      mount_path ? mount_path : "");
+            record->mounted = mount != NULL;
+            record->can_mount = g_volume_can_mount(volume);
+            record->removable = 1;
+            record->volume = g_object_ref(volume);
+        }
+
+        g_free(mount_path);
+#ifdef __FreeBSD__
+        g_free(filesystem_label);
+#endif
+        g_free(class_id);
+        g_free(device);
+        g_free(uuid);
+        g_free(name);
+        g_clear_object(&drive);
+        g_clear_object(&mount_root);
+        g_clear_object(&mount);
+    }
+    g_list_free_full(volumes, g_object_unref);
+
+    qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
+          cmp_drive_records);
+    debug_log("drive snapshot ready count=%d", drive_count);
+#endif
+}
+
+static void mark_attached_drive_unmounted(const char *id) {
+    if (!id || !id[0])
+        return;
+    for (int i = 0; i < drive_count; i++) {
+        if (strcmp(drives[i].id, id) != 0)
+            continue;
+        drives[i].mounted = 0;
+        drives[i].can_mount = 1;
+        drives[i].mount_path[0] = '\0';
+        return;
+    }
+}
+
+#ifdef __FreeBSD__
+static void mark_attached_device_unmounted(const char *device) {
+    if (!device || !device[0])
+        return;
+    for (int i = 0; i < drive_count; i++) {
+        if (!same_device_path(drives[i].device, device))
+            continue;
+        drives[i].mounted = 0;
+        drives[i].can_mount = 1;
+        drives[i].mount_path[0] = '\0';
+        return;
+    }
+}
+#endif
+
+static int path_matches_boundary(const char *path, const char *boundary) {
+    size_t len;
+
+    if (!path || !boundary)
+        return 0;
+    if (strcmp(path, boundary) == 0)
+        return 1;
+    len = strlen(boundary);
+    return strncmp(path, boundary, len) == 0 && path[len] == '/' &&
+           path[len + 1] == '\0';
+}
+
+/* Returns 0 for /media, 1 for /run/media, and -1 for every non-boundary
+ * path.  Descendants below $USER are deliberately not aliases. */
+static int media_boundary_for_user(const char *path, const char *user,
+                                   int *includes_user) {
+    char user_path[PATH_MAX];
+    const char *roots[] = { "/media", "/run/media" };
+
+    if (includes_user)
+        *includes_user = 0;
+    if (!path || !user || !user[0])
+        return -1;
+
+    for (int i = 0; i < 2; i++) {
+        if (path_matches_boundary(path, roots[i]))
+            return i;
+        if (snprintf(user_path, sizeof(user_path), "%s/%s", roots[i], user) <
+                (int)sizeof(user_path) &&
+            path_matches_boundary(path, user_path)) {
+            if (includes_user)
+                *includes_user = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int media_user_directory_exists(int root_index, const char *user) {
+    const char *roots[] = { "/media", "/run/media" };
+    char path[PATH_MAX];
+    struct stat st;
+
+    if (root_index < 0 || root_index > 1 || !user || !user[0] ||
+        snprintf(path, sizeof(path), "%s/%s", roots[root_index], user) >=
+            (int)sizeof(path))
+        return 0;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int media_root_has_drive_mounts(int root_index, const char *user) {
+    const char *roots[] = { "/media", "/run/media" };
+    char prefix[PATH_MAX];
+    size_t prefix_len;
+
+    if (root_index < 0 || root_index > 1 || !user || !user[0] ||
+        snprintf(prefix, sizeof(prefix), "%s/%s/", roots[root_index], user) >=
+            (int)sizeof(prefix))
+        return 0;
+    prefix_len = strlen(prefix);
+
+    for (int i = 0; i < drive_count; i++) {
+        if (drives[i].mounted &&
+            strncmp(drives[i].mount_path, prefix, prefix_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int choose_media_root(int preferred, int media_has_mounts,
+                             int run_has_mounts, int media_user_exists,
+                             int run_user_exists) {
+    int mounts[] = { media_has_mounts, run_has_mounts };
+    int exists[] = { media_user_exists, run_user_exists };
+    int other = preferred == 0 ? 1 : 0;
+
+    if (preferred < 0 || preferred > 1)
+        return 0;
+    if (mounts[preferred])
+        return preferred;
+    if (mounts[other])
+        return other;
+    if (exists[preferred])
+        return preferred;
+    if (exists[other])
+        return other;
+    return preferred;
+}
+
+/* /media remains a convenient root entry on distributions that actually use
+ * /run/media.  Alias only the two media roots and their exact $USER boundary;
+ * never redirect an empty directory inside a mounted drive. */
+static const char *current_username(void) {
+    const char *user = getenv("USER");
+    if (!user || !user[0])
+        user = getenv("LOGNAME");
+    return user && user[0] ? user : NULL;
+}
+
+static int resolve_media_directory(char *out, size_t outsz,
+                                   const char *requested) {
+    const char *roots[] = { "/media", "/run/media" };
+    const char *user;
+    int includes_user;
+    int preferred;
+    int chosen;
+
+    if (!requested)
+        return safe_copy(out, outsz, "");
+
+#ifdef __APPLE__
+    if (strcmp(requested, "/media") == 0 ||
+        strcmp(requested, "/run/media") == 0)
+        return safe_copy(out, outsz, "/Volumes");
+    user = current_username();
+    if (user) {
+        char media_user[PATH_MAX];
+        char run_media_user[PATH_MAX];
+
+        snprintf(media_user, sizeof(media_user), "/media/%s", user);
+        snprintf(run_media_user, sizeof(run_media_user), "/run/media/%s",
+                 user);
+        if (strcmp(requested, media_user) == 0 ||
+            strcmp(requested, run_media_user) == 0)
+            return safe_copy(out, outsz, "/Volumes");
+    }
+    return safe_copy(out, outsz, requested);
+#endif
+
+#ifdef __FreeBSD__
+    if (freebsd_resolve_media_alias(out, outsz, requested))
+        return 1;
+#endif
+
+    user = current_username();
+    if (!user)
+        return safe_copy(out, outsz, requested);
+
+    preferred = media_boundary_for_user(requested, user, &includes_user);
+    if (preferred < 0)
+        return safe_copy(out, outsz, requested);
+
+    chosen = choose_media_root(
+        preferred,
+        media_root_has_drive_mounts(0, user),
+        media_root_has_drive_mounts(1, user),
+        media_user_directory_exists(0, user),
+        media_user_directory_exists(1, user));
+
+    if (!includes_user)
+        return safe_copy(out, outsz, roots[chosen]);
+    return snprintf(out, outsz, "%s/%s", roots[chosen], user) <
+           (int)outsz;
+}
+
+static int media_directory_accepts_unmounted_volumes(const char *path) {
+#ifdef __APPLE__
+    return path && strcmp(path, "/Volumes") == 0;
+#else
+    const char *user = current_username();
+    int includes_user;
+    int root;
+
+    if (!user)
+        return 0;
+    root = media_boundary_for_user(path, user, &includes_user);
+    if (root < 0)
+        return 0;
+    return includes_user || !media_user_directory_exists(root, user);
+#endif
+}
+
+static int entry_name_exists(const Entry *target, int count,
+                             const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(target[i].name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void unique_drive_display_name(char *out, size_t outsz,
+                                      const Entry *target, int count,
+                                      const DriveRecord *record) {
+    char candidate[NAME_MAX + 1];
+    const char *device_name = base_name(record->device);
+
+    safe_copy(candidate, sizeof(candidate), record->name);
+    if (!entry_name_exists(target, count, candidate)) {
+        safe_copy(out, outsz, candidate);
+        return;
+    }
+
+    for (int suffix = 1; suffix < 1000; suffix++) {
+        char tag[96];
+        size_t tag_len;
+        size_t name_len;
+
+        if (suffix == 1)
+            snprintf(tag, sizeof(tag), " [%.63s]", device_name);
+        else
+            snprintf(tag, sizeof(tag), " [%.63s] (%d)", device_name,
+                     suffix);
+        tag_len = strlen(tag);
+        name_len = tag_len < NAME_MAX ? NAME_MAX - tag_len : 0;
+        snprintf(candidate, sizeof(candidate), "%.*s%s", (int)name_len,
+                 record->name, tag);
+        if (!entry_name_exists(target, count, candidate)) {
+            safe_copy(out, outsz, candidate);
+            return;
+        }
+    }
+    safe_copy(out, outsz, record->device);
+}
+
+#ifdef __FreeBSD__
+static int freebsd_unmounted_drive_has_media_key(const char *key) {
+    if (!key || !key[0])
+        return 0;
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].mounted && drives[i].can_mount &&
+            drives[i].media_key[0] &&
+            strcmp(drives[i].media_key, key) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int append_unmounted_drives_from_snapshot(
+    Entry *target, int count, int capacity, const DriveRecord *snapshot,
+    int snapshot_count, const char *context, int skip_existing_names) {
+#else
+static int append_unmounted_drives_from_snapshot(
+    Entry *target, int count, int capacity, const DriveRecord *snapshot,
+    int snapshot_count, const char *context) {
+#endif
+    if (!target || !snapshot || count < 0 || capacity < 0 ||
+        count > capacity)
+        return count;
+
+    for (int i = 0; i < snapshot_count && count < capacity; i++) {
+        const DriveRecord *record = &snapshot[i];
+        if (!record->removable || record->mounted || !record->can_mount ||
+            !record->name[0] || !record->device[0])
+            continue;
+#ifdef __FreeBSD__
+        if (skip_existing_names && record->media_key[0] &&
+            entry_name_exists(target, count, record->media_key))
+            continue;
+#endif
+
+        unique_drive_display_name(target[count].name,
+                                  sizeof(target[count].name), target, count,
+                                  record);
+        target[count].is_dir = 1;
+        target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+        target[count].drive_index = i;
+        debug_log("%s entry insert source=drive-snapshot index=%d "
+                  "name=\"%s\" id=\"%s\" device=\"%s\"",
+                  context ? context : "listing", count, target[count].name,
+                  record->id, record->device);
+        count++;
+    }
+    return count;
+}
+
+static int append_unmounted_drive_entries(Entry *target, int count,
+                                          int capacity, const char *path,
+                                          const char *context) {
+    if (!media_directory_accepts_unmounted_volumes(path))
+        return count;
+#ifdef __FreeBSD__
+    int skip_existing_names = path && strcmp(path, "/media") == 0;
+    return append_unmounted_drives_from_snapshot(
+        target, count, capacity, drives, drive_count, context,
+        skip_existing_names);
+#else
+    return append_unmounted_drives_from_snapshot(
+        target, count, capacity, drives, drive_count, context);
+#endif
+}
+
+/* Return 1 for a known directory, 0 for a known non-directory, and -1 when
+ * readdir() cannot tell us.  Network filesystems commonly report DT_UNKNOWN;
+ * doing fstatat() here would turn one directory open into hundreds or
+ * thousands of synchronous network round trips.  Unknown rows are resolved
+ * only when the user highlights or activates them. */
+static int dir_entry_is_dir(DIR *dir, const struct dirent *de) {
+    (void)dir;
+#ifdef DT_DIR
+    if (de->d_type == DT_DIR)
+        return 1;
+    if (de->d_type != DT_UNKNOWN && de->d_type != DT_LNK)
+        return 0;
+#endif
+    return -1;
+}
+
+/* Hide ext-family recovery machinery from ordinary browsing, but only at the
+ * actual root of that filesystem.  A user-created directory named
+ * "lost+found" elsewhere remains visible. */
+static int should_hide_lost_found(const char *dir_path, DIR *dir,
+                                  const struct dirent *de) {
+#ifdef __linux__
+    struct stat here;
+    struct stat parent;
+    struct statfs fs;
+    char parent_path[PATH_MAX];
+
+    if (show_hidden || !dir_path || !dir || !de ||
+        strcmp(de->d_name, "lost+found") != 0 ||
+        dir_entry_is_dir(dir, de) != 1)
+        return 0;
+
+    if (stat(dir_path, &here) != 0 || statfs(dir_path, &fs) != 0)
+        return 0;
+
+    /* ext2, ext3, and ext4 all use the same filesystem magic. */
+    if ((unsigned long)fs.f_type != 0xEF53UL)
+        return 0;
+
+    if (strcmp(dir_path, "/") == 0)
+        return 1;
+
+    if (snprintf(parent_path, sizeof(parent_path), "%s/..", dir_path) >=
+        (int)sizeof(parent_path) || stat(parent_path, &parent) != 0)
+        return 0;
+
+    return here.st_dev != parent.st_dev;
+#else
+    (void)dir_path;
+    (void)dir;
+    (void)de;
+    return 0;
+#endif
+}
+
+/* Every pane uses the same listing path.  Filesystem rows and cached virtual
+ * drive rows therefore have identical filtering, sorting, and collision
+ * behavior. */
+static int build_directory_entries(const char *path, Entry *target,
+                                   int capacity, const char *context) {
+    DIR *dir;
+    struct dirent *de;
+    int count = 0;
+
+    if (!path || !target || capacity <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (network_ui_path(path))
+        return network_directory_entries(path, target, capacity);
+#ifdef __FreeBSD__
+    if (strcmp(path, "/media") == 0) {
+        int media_count =
+            freebsd_build_media_entries(target, capacity, context);
+
+        if (media_count >= 0)
+            return media_count;
+    }
+#endif
+    dir = opendir(path);
+    if (!dir)
+        return -1;
+
+    while ((de = readdir(dir)) != NULL && count < capacity) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (!show_hidden && de->d_name[0] == '.')
+            continue;
+        if (should_hide_lost_found(path, dir, de))
+            continue;
+#ifdef __FreeBSD__
+        if (strcmp(path, "/media") == 0 &&
+            !freebsd_media_entry_is_mounted(path, de->d_name)) {
+            if (freebsd_should_hide_media_entry(path, de->d_name))
+                continue;
+            /*
+             * Prefer the GIO snapshot row for an attached drive.  It carries
+             * the exact device identity and a friendly display name; the
+             * autofs directory name is only a lookup key.  Duplicate labels
+             * are then represented by distinct, device-qualified rows.
+             */
+            if (freebsd_unmounted_drive_has_media_key(de->d_name))
+                continue;
+            safe_copy(target[count].name, sizeof(target[count].name),
+                      de->d_name);
+            target[count].is_dir = 1;
+            target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+            target[count].drive_index = -1;
+            count++;
+            continue;
+        }
+        if (freebsd_should_hide_media_entry(path, de->d_name))
+            continue;
+        if (freebsd_media_entry_is_unmounted_key(path, de->d_name)) {
+            safe_copy(target[count].name, sizeof(target[count].name),
+                      de->d_name);
+            target[count].is_dir = 1;
+            target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+            target[count].drive_index = -1;
+            count++;
+            continue;
+        }
+#endif
+
+        safe_copy(target[count].name, sizeof(target[count].name),
+                  de->d_name);
+        target[count].is_dir = dir_entry_is_dir(dir, de);
+        if (target[count].is_dir < 0) {
+            char full[PATH_MAX];
+            int cached_type;
+
+            join_path(full, path, de->d_name);
+            if (directory_preview_cached_type(full, &cached_type))
+                target[count].is_dir = cached_type;
+        }
+        target[count].kind = ENTRY_FILESYSTEM;
+        target[count].drive_index = -1;
+        count++;
+    }
+    closedir(dir);
+
+    count = append_unmounted_drive_entries(target, count, capacity, path,
+                                           context);
+    qsort(target, (size_t)count, sizeof(Entry), cmp_entries);
+    return count;
+}
+
+#include "simplefiles-network.h"
+
+static void unique_paste_path(char *dst, const char *dir, const char *name) {
+    char candidate[PATH_MAX];
+    char suffix[256] = "";
+
+    for (int i = 0; i < 200; i++) {
+        char joined_name[NAME_MAX + 256 + 1];
+        if (!safe_join3(joined_name, sizeof(joined_name), name, "", suffix))
+            continue;
+        if (!safe_join3(candidate, sizeof(candidate), dir, "/", joined_name))
+            continue;
+
+        if (!path_exists(candidate)) {
+            safe_copy(dst, PATH_MAX, candidate);
+            return;
+        }
+
+        strncat(suffix, "_", sizeof(suffix) - strlen(suffix) - 1);
+    }
+
+    {
+        char fallback[NAME_MAX + 64];
+        if (snprintf(fallback, sizeof(fallback), "%s.%ld", name, (long)time(NULL)) < (int)sizeof(fallback))
+            safe_join3(dst, PATH_MAX, dir, "/", fallback);
+        else
+            dst[0] = '\0';
+    }
+}
+
+static int mkdir_p(const char *path) {
+    char tmp[PATH_MAX];
+
+    strncpy(tmp, path, PATH_MAX - 1);
+    tmp[PATH_MAX - 1] = '\0';
+
+    size_t len = strlen(tmp);
+    if (len == 0)
+        return -1;
+
+    if (tmp[len - 1] == '/')
+        tmp[len - 1] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+                return -1;
+            *p = '/';
+        }
+    }
+
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+        return -1;
+
+    return 0;
+}
+
+static int get_configured_trash_dir(char *out) {
+    if (!config_trash_dir[0])
+        return -1;
+
+    expand_config_path(out, config_trash_dir);
+    if (!out[0])
+        return -1;
+    return mkdir_p(out);
+}
+
+static const char *skip_spaces(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static void expand_path(char *out, const char *in) {
+    in = skip_spaces(in);
+
+    if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/')) {
+        const char *home = getenv("HOME");
+        if (!home) home = "";
+        snprintf(out, PATH_MAX, "%s%s", home, in + 5);
+        return;
+    }
+
+    if (in[0] == '~') {
+        const char *home = getenv("HOME");
+        if (!home) home = "";
+
+        if (in[1] == '\0')
+            snprintf(out, PATH_MAX, "%s", home);
+        else if (in[1] == '/')
+            snprintf(out, PATH_MAX, "%s/%s", home, in + 2);
+        else
+            snprintf(out, PATH_MAX, "%s", in);
+        return;
+    }
+
+    if (in[0] == '/') {
+        snprintf(out, PATH_MAX, "%s", in);
+        return;
+    }
+
+    join_path(out, cwd_path, in);
+}
+
+static void expand_config_path(char *out, const char *in) {
+    const char *home;
+
+    out[0] = '\0';
+    in = skip_spaces(in);
+    home = getenv("HOME");
+
+    if (!in[0])
+        return;
+
+    if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/')) {
+        if (!home || !*home)
+            return;
+        snprintf(out, PATH_MAX, "%s%s", home, in + 5);
+        return;
+    }
+
+    if (in[0] == '~' && (in[1] == '\0' || in[1] == '/')) {
+        if (!home || !*home)
+            return;
+        snprintf(out, PATH_MAX, "%s%s", home, in + 1);
+        return;
+    }
+
+    if (in[0] == '/') {
+        snprintf(out, PATH_MAX, "%s", in);
+        return;
+    }
+
+    if (!home || !*home)
+        return;
+
+    if (!safe_join3(out, PATH_MAX, home, "/", in))
+        out[0] = '\0';
+}
+
+/* Command and search buffers stay in the byte encoding used by filesystem
+ * names, while every cursor position is kept on a complete multibyte
+ * character boundary.  Invalid filename bytes remain editable one byte at a
+ * time and are rendered as '?', so they can never turn into terminal control
+ * characters or leave stale cells behind. */
+static int text_character_at(const char *text, int length, int offset,
+                             wchar_t *character, int *columns) {
+    mbstate_t state;
+    wchar_t decoded;
+    size_t used;
+    int width;
+
+    if (!text || offset < 0 || offset >= length)
+        return 0;
+
+    memset(&state, 0, sizeof(state));
+    used = mbrtowc(&decoded, text + offset, (size_t)(length - offset), &state);
+    if (used == (size_t)-1 || used == (size_t)-2 || used == 0) {
+        decoded = L'?';
+        used = 1;
+    }
+
+    width = wcwidth(decoded);
+    if (width < 0) {
+        decoded = L'?';
+        width = 1;
+    }
+
+    if (character)
+        *character = decoded;
+    if (columns)
+        *columns = width;
+    return (int)used;
+}
+
+static int text_next_offset(const char *text, int length, int offset) {
+    int used;
+
+    if (offset < 0)
+        offset = 0;
+    if (offset >= length)
+        return length;
+
+    used = text_character_at(text, length, offset, NULL, NULL);
+    if (used <= 0 || used > length - offset)
+        used = 1;
+    return offset + used;
+}
+
+static int text_boundary_at_or_before(const char *text, int length,
+                                      int wanted) {
+    int offset = 0;
+
+    if (wanted <= 0)
+        return 0;
+    if (wanted >= length)
+        return length;
+
+    while (offset < wanted) {
+        int next = text_next_offset(text, length, offset);
+        if (next > wanted)
+            break;
+        offset = next;
+    }
+    return offset;
+}
+
+static int text_previous_offset(const char *text, int length, int offset) {
+    int previous = 0;
+    int current = 0;
+
+    offset = text_boundary_at_or_before(text, length, offset);
+    if (offset <= 0)
+        return 0;
+
+    while (current < offset) {
+        int next = text_next_offset(text, length, current);
+        if (next >= offset)
+            return current;
+        previous = current;
+        current = next;
+    }
+    return previous;
+}
+
+static int text_columns_between(const char *text, int length,
+                                int start, int end) {
+    int columns = 0;
+    int offset;
+
+    start = text_boundary_at_or_before(text, length, start);
+    end = text_boundary_at_or_before(text, length, end);
+    if (end < start)
+        return 0;
+
+    for (offset = start; offset < end;) {
+        int width = 1;
+        int used = text_character_at(text, length, offset, NULL, &width);
+
+        if (used <= 0 || used > end - offset)
+            used = 1;
+        if (width > 0 && columns <= INT_MAX - width)
+            columns += width;
+        offset += used;
+    }
+    return columns;
+}
+
+static int text_insert_wchar(char *text, size_t capacity, int *length,
+                             int *cursor_offset, wint_t input) {
+    mbstate_t state;
+    char encoded[MB_LEN_MAX];
+    wchar_t character;
+    size_t encoded_length;
+
+    if (!text || !length || !cursor_offset || capacity == 0 ||
+        *length < 0 || (size_t)*length >= capacity ||
+        *cursor_offset < 0 || *cursor_offset > *length || input == WEOF ||
+        (uintmax_t)input > (uintmax_t)WCHAR_MAX)
+        return 0;
+
+    character = (wchar_t)input;
+    if (!iswprint(character))
+        return 0;
+
+    memset(&state, 0, sizeof(state));
+    encoded_length = wcrtomb(encoded, character, &state);
+    if (encoded_length == (size_t)-1 || encoded_length == 0 ||
+        encoded_length > capacity - 1 - (size_t)*length)
+        return 0;
+
+    *cursor_offset = text_boundary_at_or_before(
+        text, *length, *cursor_offset);
+    memmove(text + *cursor_offset + encoded_length,
+            text + *cursor_offset,
+            (size_t)(*length - *cursor_offset + 1));
+    memcpy(text + *cursor_offset, encoded, encoded_length);
+    *cursor_offset += (int)encoded_length;
+    *length += (int)encoded_length;
+    return 1;
+}
+
+static void start_command(const char *initial) {
+    command_mode = 1;
+    pending_key = 0;
+    pending_delete = 0;
+    pending_permanent_delete = 0;
+    pending_empty_trash = 0;
+    command_entry_path[0] = '\0';
+
+    /* A background operation may refresh the directory and move the cursor
+     * while this editor is open.  Commands such as rename must still act on
+     * the entry that was focused when editing began. */
+    if (cursor >= 0 && cursor < entry_count)
+        join_path(command_entry_path, cwd_path, entries[cursor].name);
+
+    if (!initial) initial = "";
+
+    strncpy(command, initial, sizeof(command) - 1);
+    command[sizeof(command) - 1] = '\0';
+    command_len = (int)strlen(command);
+    command_cursor = command_len;
+    command_view_start = 0;
+}
+
+static void start_search(void) {
+    search_mode = 1;
+    pending_key = 0;
+    pending_delete = 0;
+    pending_permanent_delete = 0;
+    pending_empty_trash = 0;
+    search_query[0] = '\0';
+    search_len = 0;
+}
+
+static void start_rename_command(void) {
+    if (entry_count <= 0) {
+        set_message("nothing to rename");
+        return;
+    }
+
+    char initial[1024];
+    snprintf(initial, sizeof(initial), "rename %s", entries[cursor].name);
+    start_command(initial);
+
+    /* Renaming normally changes the stem while retaining the extension.  Put
+     * the cursor before that extension so Backspace removes the complete
+     * suffix immediately; this avoids the easy off-by-one that left a closing
+     * ']' stranded to the right of the cursor.  Dotfiles and directories keep
+     * the traditional end position. */
+    if (!entries[cursor].is_dir) {
+        const char *name = entries[cursor].name;
+        const char *extension = strrchr(name, '.');
+
+        if (extension && extension != name && extension[1] != '\0')
+            command_cursor = (int)(sizeof("rename ") - 1) +
+                             (int)(extension - name);
+    }
+}
+
+static int empty_configured_trash(int *ok, int *fail) {
+    char trash[PATH_MAX];
+    if (get_configured_trash_dir(trash) != 0)
+        return -1;
+
+    DIR *dir = opendir(trash);
+    if (!dir)
+        return -1;
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+
+        char full[PATH_MAX];
+        join_path(full, trash, de->d_name);
+
+        if (remove_recursive(full) == 0)
+            (*ok)++;
+        else
+            (*fail)++;
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+/* Do not enumerate GIO's merged trash: view here.  Even discovering its
+ * children can stat a disconnected hard NFS mount indefinitely.  Read mount
+ * names without touching their filesystems, and isolate each location in a
+ * worker.  A stalled worker must never hold the supervisor in waitpid(). */
+#ifdef __linux__
+#define TRASH_DEFERRED 3
+#define TRASH_DEFERRED_FAILED 4
+#ifndef SIMPLEFILES_TRASH_IDLE_MS
+#define SIMPLEFILES_TRASH_IDLE_MS 1500
+#endif
+#ifndef SIMPLEFILES_TRASH_PROBE_MS
+#define SIMPLEFILES_TRASH_PROBE_MS 500
+#endif
+static int trash_progress_fd = -1;
+#ifdef SIMPLEFILES_TRASH_TEST
+static void (*trash_location_test_hook)(const char *) = NULL;
+static const char *trash_mount_table_test_path = NULL;
+static const char *trash_rpcbind_port_test = NULL;
+#endif
+
+static const char *trash_mount_table(void) {
+#ifdef SIMPLEFILES_TRASH_TEST
+    if (trash_mount_table_test_path)
+        return trash_mount_table_test_path;
+#endif
+    return "/proc/self/mounts";
+}
+
+static int trash_mount_option(const char *options, const char *key,
+                              char *out, size_t size) {
+    size_t key_size = strlen(key);
+    for (const char *p = options; p && *p;) {
+        const char *end = strchr(p, ',');
+        size_t length = end ? (size_t)(end - p) : strlen(p);
+        if (length > key_size && !strncmp(p, key, key_size) && p[key_size] == '=') {
+            size_t value_size = length - key_size - 1;
+            if (value_size >= size) return -1;
+            memcpy(out, p + key_size + 1, value_size);
+            out[value_size] = '\0';
+            return 1;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+static int trash_socket_ready(int fd, short events, int64_t deadline) {
+    for (;;) {
+        struct pollfd ready = { .fd = fd, .events = events };
+        int remaining = sui_ms_until(deadline, INT_MAX);
+        if (remaining <= 0) return 0;
+        int result = poll(&ready, 1, remaining);
+        if (result < 0 && errno == EINTR) continue;
+        return result > 0 && (ready.revents & (events | POLLHUP | POLLERR));
+    }
+}
+
+static int trash_socket_transfer(int fd, void *buffer, size_t length,
+                                int writing, int64_t deadline) {
+    size_t done = 0;
+    while (done < length) {
+        if (!trash_socket_ready(fd, writing ? POLLOUT : POLLIN, deadline)) return 0;
+        ssize_t count = writing ? send(fd, (char *)buffer + done, length - done, MSG_NOSIGNAL) :
+                                  recv(fd, (char *)buffer + done, length - done, 0);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (count <= 0) return 0;
+        done += (size_t)count;
+    }
+    return 1;
+}
+
+static uint32_t trash_rpc_word(const unsigned char *reply, size_t word) {
+    uint32_t value;
+    memcpy(&value, reply + word * sizeof(value), sizeof(value));
+    return ntohl(value);
+}
+
+/* A read-only NFS NULL call checks the mounted server's service without
+ * entering the filesystem or trusting cached directory entries. RPC framing
+ * follows RFC 5531; NFS NULL is procedure 0 in versions 2, 3 and 4. */
+static int trash_rpc_probe(const char *host, const char *port, int udp,
+                           unsigned int program, unsigned int version,
+                           unsigned int procedure, const uint32_t *arguments,
+                           size_t argument_count, uint32_t *mapped_port, int tls) {
+    struct addrinfo hints = { .ai_family = AF_UNSPEC,
+                             .ai_socktype = udp ? SOCK_DGRAM : SOCK_STREAM };
+    struct addrinfo *addresses = NULL;
+    int64_t deadline = sui_monotonic_ms() + SIMPLEFILES_TRASH_PROBE_MS;
+    uint32_t xid = (uint32_t)sui_monotonic_ms() ^ (uint32_t)getpid();
+    uint32_t call[15] = { 0, htonl(xid), 0, htonl(2),
+                          htonl(program), htonl(version), htonl(procedure), 0, 0, 0, 0 };
+    if (argument_count > 4) return 0;
+    size_t call_size = (11 + argument_count) * sizeof(uint32_t);
+    call[0] = htonl(0x80000000U | (uint32_t)(call_size - 4));
+    for (size_t i = 0; i < argument_count; i++) call[11 + i] = htonl(arguments[i]);
+    int reachable = 0;
+    /* Live Linux mount options contain the numeric addr. DNS fallback, when
+     * needed for older mount records, also runs inside the bounded worker. */
+    if (getaddrinfo(host, port, &hints, &addresses) != 0) return 0;
+    for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        int fd = socket(address->ai_family, address->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        address->ai_protocol);
+        if (fd < 0) continue;
+        int connected = connect(fd, address->ai_addr, address->ai_addrlen);
+        if (connected != 0) {
+            int error = 0;
+            socklen_t size = sizeof(error);
+            if (errno != EINPROGRESS || !trash_socket_ready(fd, POLLOUT, deadline) ||
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error) {
+                close(fd);
+                continue;
+            }
+        }
+        /* TLS mounts use the kernel's authenticated connection for filesystem
+         * operations. A plaintext RPC cannot test that transport; confirm the
+         * endpoint and retain the existing bounded filesystem worker instead. */
+        if (tls && !udp) { close(fd); reachable = 1; break; }
+        unsigned char reply[1024];
+        size_t reply_size = 0;
+        int valid = trash_socket_transfer(fd, udp ? call + 1 : call,
+                                          call_size - (udp ? 4 : 0), 1, deadline);
+        if (valid && udp) {
+            ssize_t count = -1;
+            if (trash_socket_ready(fd, POLLIN, deadline)) count = recv(fd, reply, sizeof(reply), 0);
+            valid = count > 0;
+            if (valid) reply_size = (size_t)count;
+        } else if (valid) {
+            uint32_t marker;
+            for (;;) {
+                if (!trash_socket_transfer(fd, &marker, sizeof(marker), 0, deadline)) { valid = 0; break; }
+                marker = ntohl(marker);
+                size_t length = marker & 0x7fffffffU;
+                if (length > sizeof(reply) - reply_size ||
+                    !trash_socket_transfer(fd, reply + reply_size, length, 0, deadline)) { valid = 0; break; }
+                reply_size += length;
+                if (marker & 0x80000000U) break;
+            }
+        }
+        close(fd);
+        if (!valid || reply_size < 12 || trash_rpc_word(reply, 0) != xid ||
+            trash_rpc_word(reply, 1) != 1) continue;
+        uint32_t accepted = trash_rpc_word(reply, 2);
+        if (accepted == 0 && reply_size >= 24 && trash_rpc_word(reply, 4) <= reply_size - 24) {
+            uint32_t verifier = trash_rpc_word(reply, 4);
+            size_t status_word = 5 + ((size_t)verifier + 3) / 4;
+            if ((status_word + 1) * 4 <= reply_size && trash_rpc_word(reply, status_word) == 0) {
+                reachable = 1;
+                if (mapped_port) {
+                    reachable = (status_word + 2) * 4 <= reply_size;
+                    if (reachable) *mapped_port = trash_rpc_word(reply, status_word + 1);
+                }
+            }
+        } else if (!mapped_port && accepted == 1 && reply_size >= 20 && trash_rpc_word(reply, 3) == 1) {
+            /* An RPC authentication rejection proves the server is responding.
+             * The kernel mount supplies its credentials for actual deletion. */
+            reachable = 1;
+        }
+        if (reachable) break;
+    }
+    freeaddrinfo(addresses);
+    return reachable;
+}
+
+static int trash_nfs_probe(const char *host, char *port, size_t port_size,
+                           int udp, unsigned int version, int tls, int discover_port) {
+    if (discover_port) {
+        uint32_t arguments[] = {100003, version, udp ? IPPROTO_UDP : IPPROTO_TCP, 0};
+        uint32_t mapped = 0;
+        const char *rpcbind_port = "111";
+#ifdef SIMPLEFILES_TRASH_TEST
+        if (trash_rpcbind_port_test) rpcbind_port = trash_rpcbind_port_test;
+#endif
+        /* NFSv2/v3 and explicit port=0 may use a nonstandard registered port.
+         * rpcbind availability alone never authorizes filesystem access. */
+        if (trash_rpc_probe(host, rpcbind_port, udp, 100000, 2, 3,
+                            arguments, 4, &mapped, 0) && mapped > 0 && mapped <= 65535)
+            snprintf(port, port_size, "%u", mapped);
+    }
+    return trash_rpc_probe(host, port, udp, 100003, version, 0, NULL, 0, NULL, tls);
+}
+
+/* Match mount names lexically: never stat/realpath a possibly offline mount
+ * before checking the server. Longest prefix handles nested local mounts. */
+static int trash_path_reachable(const char *path, const char *required_nfs_source) {
+    char source[PATH_MAX] = "", options[4096] = "", host[NI_MAXHOST], port[16] = "2049";
+    char required[PATH_MAX] = "", mount_root[PATH_MAX] = "";
+    char value[64];
+    size_t longest = 0;
+    int nfs = 0, nfs4 = 0;
+    /* getmntent uses static storage, including the caller's source string. */
+    if (required_nfs_source && !safe_copy(required, sizeof(required), required_nfs_source)) return 0;
+    char *absolute = g_canonicalize_filename(path, cwd_path[0] == '/' ? cwd_path : NULL);
+    FILE *mounts = setmntent(trash_mount_table(), "r");
+    if (!mounts) { g_free(absolute); return -1; }
+    struct mntent *mount;
+    while ((mount = getmntent(mounts)) != NULL) {
+        size_t length = strlen(mount->mnt_dir);
+        if (length < longest || strncmp(absolute, mount->mnt_dir, length) ||
+            (length > 1 && absolute[length] && absolute[length] != '/')) continue;
+        longest = length;
+        if (!safe_copy(mount_root, sizeof(mount_root), mount->mnt_dir)) {
+            endmntent(mounts); g_free(absolute); return 0;
+        }
+        nfs = !strcmp(mount->mnt_type, "nfs") || !strcmp(mount->mnt_type, "nfs4");
+        nfs4 = !strcmp(mount->mnt_type, "nfs4");
+        if (nfs && (!safe_copy(source, sizeof(source), mount->mnt_fsname) ||
+                    !safe_copy(options, sizeof(options), mount->mnt_opts))) {
+            endmntent(mounts); g_free(absolute); return 0;
+        }
+    }
+    endmntent(mounts);
+    if (required_nfs_source && (!nfs || strcmp(required, source) || strcmp(mount_root, absolute))) {
+        g_free(absolute);
+        return 0; /* The NFS mount vanished; never visit its underlying local directory. */
+    }
+    g_free(absolute);
+    if (!nfs) return 1;
+    int udp = 0, tls = 0;
+    if (trash_mount_option(options, "proto", value, sizeof(value)) == 1) {
+        udp = !strcmp(value, "udp") || !strcmp(value, "udp6");
+        /* Non-socket transports such as RDMA retain bounded filesystem I/O. */
+        if (!udp && strcmp(value, "tcp") && strcmp(value, "tcp6")) return 1;
+    }
+    if (trash_mount_option(options, "xprtsec", value, sizeof(value)) == 1)
+        tls = strcmp(value, "none") != 0;
+    unsigned int version = nfs4 ? 4 : 3;
+    if (trash_mount_option(options, "vers", value, sizeof(value)) == 1 ||
+        trash_mount_option(options, "nfsvers", value, sizeof(value)) == 1) {
+        if (value[0] >= '2' && value[0] <= '4') version = (unsigned int)(value[0] - '0');
+    }
+    int option = trash_mount_option(options, "port", value, sizeof(value));
+    int discover_port = version < 4;
+    if (option < 0) return 0;
+    if (option == 1) {
+        char *end;
+        unsigned long number = strtoul(value, &end, 10);
+        if (!*value || *end || number > 65535) return 0;
+        discover_port = number == 0;
+        if (number) snprintf(port, sizeof(port), "%lu", number);
+    }
+    option = trash_mount_option(options, "addr", host, sizeof(host));
+    if (option < 0) return 0;
+    if (!option) {
+        char *end = strstr(source, ":/");
+        if (!end) return 0;
+        *end = '\0';
+        const char *name = source;
+        if (source[0] == '[' && end > source && end[-1] == ']') { name++; end[-1] = '\0'; }
+        if (!safe_copy(host, sizeof(host), name)) return 0;
+    }
+    return trash_nfs_probe(host, port, sizeof(port), udp, version, tls, discover_port);
+}
+
+static void trash_progress(void) {
+    /* A full nonblocking pipe already has progress waiting for the reader. */
+    if (trash_progress_fd >= 0)
+        while (write(trash_progress_fd, ".", 1) < 0 && errno == EINTR) {}
+}
+
+static int trash_directory_owned(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+    return S_ISDIR(st.st_mode) && st.st_uid == getuid() ? 1 : -1;
+}
+
+static int empty_trash_location(const char *trash, int *ok, int *fail) {
+    char files[PATH_MAX], info[PATH_MAX];
+    int valid = trash_directory_owned(trash);
+    if (valid <= 0)
+        return valid;
+    if (!safe_join3(files, sizeof(files), trash, "/", "files") ||
+        !safe_join3(info, sizeof(info), trash, "/", "info"))
+        return -1;
+    /* Neither a symlinked payload directory nor a symlinked metadata
+     * directory belongs to the freedesktop trash layout. */
+    if (trash_directory_owned(files) != 1 ||
+        trash_directory_owned(info) != 1)
+        return -1;
+    DIR *dir = opendir(files);
+    if (!dir)
+        return -1;
+    for (;;) {
+        struct dirent *de;
+        char payload[PATH_MAX], metadata[PATH_MAX];
+        errno = 0;
+        de = readdir(dir);
+        if (!de) {
+            if (errno) (*fail)++;
+            break;
+        }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (!safe_join3(payload, sizeof(payload), files, "/", de->d_name) ||
+            snprintf(metadata, sizeof(metadata), "%s/%s.trashinfo", info,
+                     de->d_name) >= (int)sizeof(metadata)) {
+            (*fail)++;
+            continue;
+        }
+        /* Keep the original path metadata until its payload was removed.
+         * In particular, timeout/failure must leave recovery information. */
+        if (remove_recursive(payload) != 0) {
+            (*fail)++;
+        } else if (unlink(metadata) != 0 && errno != ENOENT) {
+            (*fail)++;
+        } else {
+            (*ok)++;
+        }
+        trash_progress();
+    }
+    closedir(dir);
+    return 0;
+}
+
+static int empty_volume_trash(const char *root, int *ok, int *fail) {
+    char trash[PATH_MAX], shared[PATH_MAX];
+    struct stat st;
+    if (snprintf(trash, sizeof(trash), "%s/.Trash-%lu", root,
+                 (unsigned long)getuid()) >= (int)sizeof(trash))
+        return -1;
+    if (empty_trash_location(trash, ok, fail) != 0)
+        (*fail)++;
+    if (!safe_join3(shared, sizeof(shared), root, "/", ".Trash"))
+        return -1;
+    if (lstat(shared, &st) != 0)
+        return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+    /* A shared .Trash must be a real sticky directory. */
+    if (!S_ISDIR(st.st_mode) || !(st.st_mode & S_ISVTX))
+        return 0;
+    if (snprintf(trash, sizeof(trash), "%s/%lu", shared,
+                 (unsigned long)getuid()) >= (int)sizeof(trash))
+        return -1;
+    return empty_trash_location(trash, ok, fail);
+}
+
+/* kind: 0 = home layout, 1 = volume layouts, 2 = configured directory.
+ * Progress renews the inactivity deadline, so a large reachable trash is
+ * allowed to finish.  The pipe is nonblocking in the deletion worker. */
+static int empty_trash_bounded_for_mount(const char *path, int kind,
+                                        const char *required_nfs_source) {
+    int channel[2];
+    pid_t pid;
+    if (pipe(channel) != 0)
+        return 1;
+    pid = fork();
+    if (pid == 0) {
+        int ok = 0, fail = 0, result;
+        char done;
+        char expanded[PATH_MAX];
+        char expected_source[PATH_MAX];
+        close(channel[0]);
+        (void)fcntl(channel[1], F_SETFL, O_NONBLOCK);
+        trash_progress_fd = channel[1];
+        if (required_nfs_source) {
+            if (!safe_copy(expected_source, sizeof(expected_source), required_nfs_source)) {
+                done = '1';
+                goto completed;
+            }
+            required_nfs_source = expected_source;
+        }
+        if (kind == 2) {
+            expand_config_path(expanded, path);
+        } else if (!safe_copy(expanded, sizeof(expanded), path)) {
+            done = '1';
+            goto completed;
+        }
+        path = expanded;
+        int reachable = trash_path_reachable(path, required_nfs_source);
+        if (reachable <= 0) {
+            done = reachable == 0 ? '3' : '1';
+            goto completed;
+        }
+#ifdef SIMPLEFILES_TRASH_TEST
+        if (trash_location_test_hook)
+            trash_location_test_hook(path);
+#endif
+        result = kind == 2 ? empty_configured_trash(&ok, &fail) :
+                 kind == 1 ? empty_volume_trash(path, &ok, &fail) :
+                             empty_trash_location(path, &ok, &fail);
+        if (result != 0) fail++;
+        /* The server may disappear after the initial probe. A failed NFS
+         * operation then remains deferred, while a live server's permission
+         * or layout failure keeps the existing failure result. */
+        done = fail && trash_path_reachable(path, required_nfs_source) == 0 ? '3' :
+               fail ? (ok ? '2' : '1') : '0';
+completed:
+        /* Drain backpressure before sending the final result. */
+        (void)fcntl(channel[1], F_SETFL, 0);
+        while (write(channel[1], &done, 1) < 0 && errno == EINTR) {}
+        _exit(0);
+    }
+    close(channel[1]);
+    if (pid < 0) {
+        close(channel[0]);
+        return 1;
+    }
+    int result = TRASH_DEFERRED;
+    for (;;) {
+        struct pollfd ready = { .fd = channel[0], .events = POLLIN };
+        int polled = poll(&ready, 1, SIMPLEFILES_TRASH_IDLE_MS);
+        if (polled < 0 && errno == EINTR)
+            continue;
+        if (polled <= 0)
+            break;
+        char buffer[256];
+        ssize_t count = read(channel[0], buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            result = 1;
+            break;
+        }
+        for (ssize_t i = 0; i < count; i++) {
+            if (buffer[i] >= '0' && buffer[i] <= '3') {
+                result = buffer[i] - '0';
+                goto finished;
+            }
+        }
+    }
+finished:
+    if (result == TRASH_DEFERRED)
+        (void)kill(pid, SIGKILL);
+    close(channel[0]);
+    /* SIGKILL stays pending during uninterruptible NFS I/O.  Never wait for
+     * it: this supervisor can finish and the child is reaped when it exits. */
+    (void)waitpid(pid, NULL, WNOHANG);
+    return result;
+}
+
+static int empty_trash_bounded(const char *path, int kind) {
+    return empty_trash_bounded_for_mount(path, kind, NULL);
+}
+
+static void accumulate_trash_result(int result, int *failed, int *deferred) {
+    if (result == TRASH_DEFERRED)
+        *deferred = 1;
+    else if (result != 0)
+        *failed = 1;
+}
+
+static int empty_default_trash(void) {
+    char home_trash[PATH_MAX];
+    const char *data = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    int failed = 0, deferred = 0;
+    if (data && data[0] == '/') {
+        if (!safe_join3(home_trash, sizeof(home_trash), data, "/", "Trash"))
+            return 1;
+    } else if (!home || home[0] != '/' ||
+               !safe_join3(home_trash, sizeof(home_trash), home, "/",
+                           ".local/share/Trash")) {
+        return 1;
+    }
+    accumulate_trash_result(empty_trash_bounded(home_trash, 0),
+                            &failed, &deferred);
+    FILE *mounts = setmntent(trash_mount_table(), "r");
+    if (!mounts) {
+        failed = 1;
+    } else {
+        struct mntent *mount;
+        while ((mount = getmntent(mounts)) != NULL) {
+            /* Kernel pseudo-filesystems cannot contain a user's trash.
+             * Mount names are decoded by getmntent; no stat/realpath here. */
+            const char *type = mount->mnt_type;
+            if (!strcmp(type, "proc") || !strcmp(type, "sysfs") ||
+                !strcmp(type, "devtmpfs") || !strcmp(type, "devpts") ||
+                !strcmp(type, "cgroup") || !strcmp(type, "cgroup2") ||
+                !strcmp(type, "securityfs") || !strcmp(type, "debugfs") ||
+                !strcmp(type, "tracefs") || !strcmp(type, "configfs") ||
+                !strcmp(type, "pstore") || !strcmp(type, "mqueue") ||
+                !strcmp(type, "hugetlbfs") || !strcmp(type, "fusectl") ||
+                !strcmp(type, "binfmt_misc") || !strcmp(type, "autofs") ||
+                !strcmp(type, "bpf") || !strcmp(type, "efivarfs") ||
+                !strcmp(type, "rpc_pipefs") || !strcmp(type, "nsfs"))
+                continue;
+            const char *nfs_source = !strcmp(type, "nfs") || !strcmp(type, "nfs4") ?
+                                     mount->mnt_fsname : NULL;
+            accumulate_trash_result(empty_trash_bounded_for_mount(mount->mnt_dir, 1, nfs_source),
+                                    &failed, &deferred);
+        }
+        endmntent(mounts);
+    }
+    return deferred ? (failed ? TRASH_DEFERRED_FAILED : TRASH_DEFERRED) :
+           failed ? 2 : 0;
+}
+#endif
+
+#ifdef __APPLE__
+static void exec_macos_files_helper(const char *action, const char *path) {
+    char executable[PATH_MAX];
+    char helper[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    char *slash;
+
+    if (_NSGetExecutablePath(executable, &size) == 0) {
+        slash = strrchr(executable, '/');
+        if (slash) {
+            *slash = '\0';
+            if (safe_join3(helper, sizeof(helper), executable, "/",
+                           "simplefiles-macos-helper")) {
+                if (path)
+                    execl(helper, "simplefiles-macos-helper", action, path,
+                          (char *)NULL);
+                else
+                    execl(helper, "simplefiles-macos-helper", action,
+                          (char *)NULL);
+            }
+        }
+    }
+    if (path)
+        execlp("simplefiles-macos-helper", "simplefiles-macos-helper",
+               action, path, (char *)NULL);
+    else
+        execlp("simplefiles-macos-helper", "simplefiles-macos-helper",
+               action, (char *)NULL);
+    _exit(127);
+}
+
+static int run_macos_files_helper(const char *action, const char *path) {
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid == 0)
+        exec_macos_files_helper(action, path);
+    if (pid < 0)
+        return -1;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
+static void empty_trash_now(void) {
+    pid_t pid;
+
+    if (!file_operation_can_start())
+        return;
+    pid = fork();
+    if (pid == 0) {
+        int ok = 0;
+        int fail = 0;
+
+        redirect_background_stdio();
+        if (!config_trash_dir[0]) {
+#ifdef __APPLE__
+            exec_macos_files_helper("--empty-trash", NULL);
+#elif defined(__linux__)
+            _exit(empty_default_trash());
+#else
+            execlp("gio", "gio", "trash", "--empty", (char *)NULL);
+            _exit(errno == ENOENT ? 127 : 126);
+#endif
+        }
+#ifdef __linux__
+        (void)ok;
+        (void)fail;
+        _exit(empty_trash_bounded(config_trash_dir, 2));
+#endif
+        if (empty_configured_trash(&ok, &fail) != 0)
+            _exit(1);
+        _exit(fail > 0 ? (ok > 0 ? 2 : 1) : 0);
+    }
+    if (pid < 0) {
+        set_message("empty trash failed: could not start");
+        return;
+    }
+
+    remember_file_operation(pid, FILE_OPERATION_EMPTY_TRASH, cwd_path, "");
+    clear_selected();
+    set_message("emptying trash in background");
+}
+
+
+static void add_open_rule(const char *ext, const char *cmd) {
+    if (!ext || !cmd || open_rule_count >= 256) return;
+
+    safe_copy(open_rules[open_rule_count].ext,
+              sizeof(open_rules[open_rule_count].ext), ext);
+
+    snprintf(open_rules[open_rule_count].cmd,
+             sizeof(open_rules[open_rule_count].cmd),
+             "%s", cmd);
+
+    open_rule_count++;
+}
+
+static const char *path_extension(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    const char *ext = strrchr(base, '.');
+
+    /* A leading dot denotes a hidden extensionless file, not an extension. */
+    if (!ext || ext == base)
+        return NULL;
+
+    return ext;
+}
+
+static const char *find_open_rule(const char *path) {
+    const char *ext = path_extension(path);
+    if (!ext) return NULL;
+    int ebook = strcasecmp(ext, ".epub") == 0 ||
+                strcasecmp(ext, ".mobi") == 0 ||
+                strcasecmp(ext, ".azw") == 0 ||
+                strcasecmp(ext, ".azw3") == 0;
+
+    for (int i = 0; i < open_rule_count; i++) {
+        if (strcasecmp(ext, open_rules[i].ext) == 0) {
+            const char *cmd = open_rules[i].cmd;
+            /* These were the terminal reader's shipped names before the
+             * split. Keep ISO-era ebook associations working after updating. */
+            if (ebook && (strcmp(cmd, "simplepdf") == 0 ||
+                          strcmp(cmd, "/usr/local/bin/simplepdf") == 0 ||
+                          strcmp(cmd, "simpleread") == 0 ||
+                          strcmp(cmd, "/usr/local/bin/simpleread") == 0))
+                return "simplebook";
+            return cmd;
+        }
+    }
+
+    if (ebook) return "simplebook";
+    if (strcasecmp(ext, ".pdf") == 0) return "simplepdf";
+    return NULL;
+}
+
+static int extension_in_text_list(const char *path) {
+    const char *ext = path_extension(path);
+    if (!ext) return 0;
+
+    char list[4096];
+    snprintf(list, sizeof(list), "%s", config_text_extensions);
+
+    char *tok = strtok(list, ",");
+    while (tok) {
+        trim_config_value(tok);
+        if (strcasecmp(tok, ext) == 0)
+            return 1;
+        tok = strtok(NULL, ",");
+    }
+
+    return 0;
+}
+
+static void trim_config_value(char *s) {
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (p != s)
+        memmove(s, p, strlen(p) + 1);
+
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\n' || s[len - 1] == '\r')) {
+        s[--len] = '\0';
+    }
+
+    len = strlen(s);
+    if (len >= 2 && ((s[0] == '"' && s[len - 1] == '"') ||
+                     (s[0] == '\'' && s[len - 1] == '\''))) {
+        memmove(s, s + 1, len - 2);
+        s[len - 2] = '\0';
+    }
+}
+
+static void load_config(void) {
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.config/simplefiles/config", home);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    char line[1024];
+
+    while (fgets(line, sizeof(line), f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+
+        char key[256];
+        char val[512];
+
+        safe_copy(key, sizeof(key), line);
+        snprintf(val, sizeof(val), "%s", eq + 1);
+
+        trim_config_value(key);
+        trim_config_value(val);
+
+        if (strcasecmp(key, "OPEN_MODE") == 0) {
+            if (strcasecmp(val, "terminal") == 0)
+                config_terminal_mode = 1;
+            else
+                config_terminal_mode = 0;
+        } else if (strcasecmp(key, "EDITOR_COMMAND") == 0) {
+            snprintf(config_editor_command,
+                     sizeof(config_editor_command),
+                     "%s",
+                     val);
+
+        } else if (strcasecmp(key, "TEXT_EXTENSIONS") == 0) {
+            snprintf(config_text_extensions,
+                     sizeof(config_text_extensions),
+                     "%s",
+                     val);
+
+        } else if (strcasecmp(key, "PREVIEW") == 0) {
+            config_preview =
+                (strcasecmp(val, "true") == 0 ||
+                 strcasecmp(val, "yes") == 0 ||
+                 strcmp(val, "1") == 0);
+
+        } else if (strcasecmp(key, "PREVIEW_LINES") == 0) {
+            config_preview_lines = atoi(val);
+            if (config_preview_lines < 1)
+                config_preview_lines = 1;
+
+        } else if (strcasecmp(key, "TRASH_DIR") == 0) {
+            snprintf(config_trash_dir,
+                     sizeof(config_trash_dir),
+                     "%s",
+                     val);
+
+        } else if (strcasecmp(key, "CONFIRM_DELETE") == 0) {
+            config_confirm_delete =
+                (strcasecmp(val, "true") == 0 ||
+                 strcasecmp(val, "yes") == 0 ||
+                 strcmp(val, "1") == 0);
+
+        } else if (strcasecmp(key, "OPEN_CACHE_MAX_MB") == 0) {
+            char *end = NULL;
+            unsigned long long mb = strtoull(val, &end, 10);
+            if (end != val && *end == '\0' &&
+                mb <= UINT64_MAX / (1024ULL * 1024ULL))
+                config_open_cache_max_bytes =
+                    (uint64_t)mb * 1024ULL * 1024ULL;
+
+        } else if (strcasecmp(key, "OPEN_CACHE_MIN_MB") == 0) {
+            char *end = NULL;
+            unsigned long long mb = strtoull(val, &end, 10);
+            if (end != val && *end == '\0' &&
+                mb <= UINT64_MAX / (1024ULL * 1024ULL))
+                config_open_cache_min_bytes =
+                    (uint64_t)mb * 1024ULL * 1024ULL;
+
+        } else if (strncasecmp(key, "OPEN_.", 6) == 0) {
+            add_open_rule(key + 5, val);
+        }
+    }
+
+    fclose(f);
+}
+
+__attribute__((unused)) static int text_file_type(const char *path) {
+    const char *ext = path_extension(path);
+
+    if (!ext)
+        return 0;
+
+    return
+        strcasecmp(ext, ".txt") == 0  ||
+        strcasecmp(ext, ".md") == 0   ||
+        strcasecmp(ext, ".markdown") == 0 ||
+        strcasecmp(ext, ".c") == 0    ||
+        strcasecmp(ext, ".h") == 0    ||
+        strcasecmp(ext, ".cpp") == 0  ||
+        strcasecmp(ext, ".hpp") == 0  ||
+        strcasecmp(ext, ".cc") == 0   ||
+        strcasecmp(ext, ".py") == 0   ||
+        strcasecmp(ext, ".sh") == 0   ||
+        strcasecmp(ext, ".conf") == 0 ||
+        strcasecmp(ext, ".ini") == 0  ||
+        strcasecmp(ext, ".log") == 0;
+}
+
+static void command_cd(const char *arg) {
+    arg = skip_spaces(arg);
+    if (arg[0] == '\0') {
+        set_message("cd needs a path");
+        return;
+    }
+
+    char path[PATH_MAX];
+    char resolved_path[PATH_MAX];
+    expand_path(path, arg);
+    resolve_media_directory(resolved_path, sizeof(resolved_path), path);
+
+    if (startup_chdir_resolved(resolved_path)) {
+        cursor = 0;
+        top = 0;
+        load_dir(cwd_path);
+        restore_dir_cursor(cwd_path);
+        set_message("changed directory");
+    } else {
+        set_message("cd failed");
+    }
+}
+
+static void command_mkdir(const char *arg) {
+    arg = skip_spaces(arg);
+    if (arg[0] == '\0') {
+        set_message("mkdir needs a name");
+        return;
+    }
+
+    char path[PATH_MAX];
+    expand_path(path, arg);
+
+    if (mkdir(path, 0755) == 0) {
+        load_dir(cwd_path);
+        set_message("directory created");
+    } else {
+        set_message("mkdir failed");
+    }
+}
+
+static void command_rename(const char *arg, const char *source_path) {
+    arg = skip_spaces(arg);
+    if (file_operation_pid > 0) {
+        set_message("wait for the background file operation to finish");
+        return;
+    }
+    if ((!source_path || source_path[0] == '\0') && entry_count <= 0) {
+        set_message("nothing to rename");
+        return;
+    }
+
+    if (arg[0] == '\0') {
+        set_message("rename needs a new name");
+        return;
+    }
+
+    char src[PATH_MAX];
+    char dst[PATH_MAX];
+
+    if (source_path && source_path[0] != '\0')
+        safe_copy(src, sizeof(src), source_path);
+    else
+        join_path(src, cwd_path, entries[cursor].name);
+    expand_path(dst, arg);
+
+    if (path_exists(dst)) {
+        set_message("rename target exists");
+        return;
+    }
+
+    if (rename(src, dst) == 0) {
+        load_dir(cwd_path);
+        set_message("renamed");
+    } else {
+        set_message("rename failed");
+    }
+}
+
+static const char *relative_to_cwd(const char *path) {
+    size_t len = strlen(cwd_path);
+
+    if (strcmp(cwd_path, "/") == 0) {
+        if (path[0] == '/')
+            return path + 1;
+        return path;
+    }
+
+    if (strncmp(path, cwd_path, len) == 0 && path[len] == '/')
+        return path + len + 1;
+
+    return path;
+}
+
+static int file_operation_can_start(void) {
+    if (file_operation_pid > 0) {
+        set_message("another file operation is already running");
+        return 0;
+    }
+    if (paste_worker_pid > 0 || delete_worker_pid > 0) {
+        set_message("another file operation is already running");
+        return 0;
+    }
+    return 1;
+}
+
+static void redirect_background_stdio(void) {
+    int devnull = open("/dev/null", O_RDWR);
+
+    if (devnull < 0)
+        return;
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO)
+        close(devnull);
+}
+
+static void remember_file_operation(pid_t pid, FileOperationKind kind,
+                                    const char *directory,
+                                    const char *target) {
+    file_operation_pid = pid;
+    file_operation_kind = kind;
+    safe_copy(file_operation_directory, sizeof(file_operation_directory),
+              directory ? directory : "");
+    safe_copy(file_operation_target, sizeof(file_operation_target),
+              target ? target : "");
+    file_operation_drive_id[0] = '\0';
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    file_operation_path[0] = '\0';
+    file_operation_device[0] = '\0';
+#endif
+}
+
+static void command_compress(const char *arg) {
+    arg = skip_spaces(arg);
+
+    if (!file_operation_can_start())
+        return;
+
+    if (arg[0] == '\0') {
+        set_message("compress needs a zip name");
+        return;
+    }
+
+    char zipname[PATH_MAX];
+    expand_path(zipname, arg);
+
+    size_t zlen = strlen(zipname);
+    if (zlen < 4 || strcmp(zipname + zlen - 4, ".zip") != 0)
+        strncat(zipname, ".zip", sizeof(zipname) - strlen(zipname) - 1);
+
+    if (path_exists(zipname)) {
+        set_message("zip target exists");
+        return;
+    }
+
+    int item_count = selected_count > 0 ? selected_count : (entry_count > 0 ? 1 : 0);
+
+    if (item_count <= 0) {
+        set_message("nothing to compress");
+        return;
+    }
+
+    struct stat cwd_stat;
+    if (stat(cwd_path, &cwd_stat) != 0 || !S_ISDIR(cwd_stat.st_mode) ||
+        access(cwd_path, X_OK) != 0) {
+        set_message("compress failed: directory unavailable");
+        return;
+    }
+
+    /* zip, -qr, archive, --, items..., NULL */
+    char **zip_argv = calloc((size_t)item_count + 5, sizeof(*zip_argv));
+    if (!zip_argv) {
+        set_message("compress failed: out of memory");
+        return;
+    }
+
+    zip_argv[0] = "zip";
+    zip_argv[1] = "-qr";
+    zip_argv[2] = zipname;
+    zip_argv[3] = "--";
+
+    for (int i = 0; i < item_count; i++) {
+        if (selected_count > 0)
+            zip_argv[i + 4] = (char *)relative_to_cwd(selected[i]);
+        else
+            zip_argv[i + 4] = entries[cursor].name;
+    }
+
+    debug_log("compress cwd=%s archive=%s items=%d", cwd_path, zipname,
+              item_count);
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        redirect_background_stdio();
+        if (chdir(cwd_path) != 0)
+            _exit(126);
+        execvp(zip_argv[0], zip_argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    free(zip_argv);
+
+    if (pid > 0) {
+        remember_file_operation(pid, FILE_OPERATION_COMPRESS, cwd_path,
+                                base_name(zipname));
+        clear_selected();
+        set_message("compressing in background");
+    } else if (pid < 0) {
+        set_message("compress failed: could not start");
+    }
+}
+
+
+static void command_extract(void) {
+    if (!file_operation_can_start())
+        return;
+    if (entry_count <= 0) {
+        set_message("nothing to extract");
+        return;
+    }
+
+    const char *name = entries[cursor].name;
+    size_t len = strlen(name);
+    size_t suffix_len = 0;
+    int is_zip = 0;
+    int is_tar = 0;
+
+    if (len >= 4 && strcasecmp(name + len - 4, ".zip") == 0) {
+        suffix_len = 4;
+        is_zip = 1;
+    } else if (len >= 7 && strcasecmp(name + len - 7, ".tar.gz") == 0) {
+        suffix_len = 7;
+        is_tar = 1;
+    } else if (len >= 8 && strcasecmp(name + len - 8, ".tar.xz") == 0) {
+        suffix_len = 8;
+        is_tar = 1;
+    } else if (len >= 9 && strcasecmp(name + len - 9, ".tar.bz2") == 0) {
+        suffix_len = 9;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".tgz") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".txz") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else if (len >= 5 && strcasecmp(name + len - 5, ".tbz2") == 0) {
+        suffix_len = 5;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".tar") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else {
+        set_message("extract needs .zip, .tar, or tarball");
+        return;
+    }
+
+    if (current_entry_is_dir()) {
+        set_message("extract needs an archive file");
+        return;
+    }
+
+    char archive_path[PATH_MAX];
+    join_path(archive_path, cwd_path, name);
+
+    char outdir[PATH_MAX];
+    if (len - suffix_len >= sizeof(outdir)) {
+        set_message("archive name too long");
+        return;
+    }
+    memcpy(outdir, name, len - suffix_len);
+    outdir[len - suffix_len] = '\0';
+
+    if (outdir[0] == '\0') {
+        set_message("archive has no usable name");
+        return;
+    }
+
+    char outpath[PATH_MAX];
+    join_path(outpath, cwd_path, outdir);
+
+    if (path_exists(outpath)) {
+        set_message("extract target exists");
+        return;
+    }
+
+    if (mkdir(outpath, 0755) != 0) {
+        set_message("extract failed: cannot create directory");
+        return;
+    }
+
+    char *extract_argv[6];
+    if (is_zip) {
+        extract_argv[0] = "unzip";
+        extract_argv[1] = "-q";
+        extract_argv[2] = archive_path;
+        extract_argv[3] = "-d";
+        extract_argv[4] = outpath;
+        extract_argv[5] = NULL;
+    } else {
+        extract_argv[0] = "tar";
+        extract_argv[1] = "-xf";
+        extract_argv[2] = archive_path;
+        extract_argv[3] = NULL;
+    }
+
+    debug_log("extract cwd=%s archive=%s target=%s type=%s",
+              cwd_path, archive_path, outpath, is_zip ? "zip" : "tar");
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        int tool_status = 0;
+        pid_t tool_pid;
+        pid_t waited;
+
+        redirect_background_stdio();
+        tool_pid = fork();
+        if (tool_pid == 0) {
+            if (is_tar && chdir(outpath) != 0)
+                _exit(126);
+            execvp(extract_argv[0], extract_argv);
+            _exit(errno == ENOENT ? 127 : 126);
+        }
+        if (tool_pid < 0) {
+            remove_recursive(outpath);
+            _exit(126);
+        }
+        do {
+            waited = waitpid(tool_pid, &tool_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != tool_pid) {
+            remove_recursive(outpath);
+            _exit(126);
+        }
+        if (!WIFEXITED(tool_status) || WEXITSTATUS(tool_status) != 0)
+            remove_recursive(outpath);
+        if (WIFEXITED(tool_status))
+            _exit(WEXITSTATUS(tool_status));
+        if (WIFSIGNALED(tool_status))
+            _exit(128 + WTERMSIG(tool_status));
+        _exit(126);
+    }
+
+    if (pid > 0) {
+        remember_file_operation(pid, FILE_OPERATION_EXTRACT, cwd_path, outdir);
+        clear_selected();
+        set_message("extracting in background");
+    } else if (pid < 0) {
+        remove_recursive(outpath);
+        set_message("extract failed: could not start");
+    }
+}
+
+static int command_starts_with(const char *cmd, const char *name) {
+    size_t n = strlen(name);
+    return strncmp(cmd, name, n) == 0 &&
+           (cmd[n] == '\0' || cmd[n] == ' ' || cmd[n] == '\t');
+}
+
+static int openwith_is_tui(const char *cmd) {
+    cmd = skip_spaces(cmd);
+
+    return command_starts_with(cmd, "nvim")        ||
+           command_starts_with(cmd, "vim")         ||
+           command_starts_with(cmd, "vi")          ||
+           command_starts_with(cmd, "nano")        ||
+           command_starts_with(cmd, "emacs")       ||
+           command_starts_with(cmd, "simplebook")   ||
+           command_starts_with(cmd, "simplewords")  ||
+           command_starts_with(cmd, "simplefiles")  ||
+           command_starts_with(cmd, "htop")         ||
+           command_starts_with(cmd, "less")         ||
+           command_starts_with(cmd, "more")         ||
+           command_starts_with(cmd, "man");
+}
+
+static void shell_quote_append(char *dst, size_t dstsz, const char *src) {
+    strncat(dst, "'", dstsz - strlen(dst) - 1);
+
+    for (const char *s = src; *s; s++) {
+        if (*s == '\'')
+            strncat(dst, "'\\''", dstsz - strlen(dst) - 1);
+        else {
+            char one[2] = {*s, '\0'};
+            strncat(dst, one, dstsz - strlen(dst) - 1);
+        }
+    }
+
+    strncat(dst, "'", dstsz - strlen(dst) - 1);
+}
+
+static void exec_openwith_detached(const char *cmd, const char *path) {
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > 2)
+            close(devnull);
+    }
+
+    char script[4096];
+    snprintf(script, sizeof(script), "exec %s \"$1\"", cmd);
+
+    execl("/bin/sh",
+          "sh",
+          "-c",
+          script,
+          "simplefiles-openwith",
+          path,
+          (char *)NULL);
+
+    _exit(127);
+}
+
+static void exec_default_open_detached(const char *path) {
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > 2)
+            close(devnull);
+    }
+
+#ifdef __APPLE__
+    execl("/usr/bin/open", "open", path, (char *)NULL);
+#else
+    execlp("gio", "gio", "open", path, (char *)NULL);
+    execlp("xdg-open", "xdg-open", path, (char *)NULL);
+    execlp("open", "open", path, (char *)NULL);
+#endif
+    _exit(127);
+}
+
+static void command_openwith(const char *arg) {
+    arg = skip_spaces(arg);
+
+    if (arg[0] == '\0') {
+        set_message("openwith needs a program");
+        return;
+    }
+
+    if (entry_count <= 0) {
+        set_message("nothing to open");
+        return;
+    }
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+
+    int is_tui = openwith_is_tui(arg);
+
+    if (is_tui) {
+        char cmd[4096];
+        int status = 0;
+        pid_t pid;
+
+        snprintf(cmd, sizeof(cmd), "%s ", arg);
+        shell_quote_append(cmd, sizeof(cmd), full);
+
+        debug_log("openwith tui before def_prog_mode/endwin command=%s", arg);
+        dismiss_image_overlay();
+        def_prog_mode();
+        endwin();
+
+        pid = fork();
+        if (pid == 0) {
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        debug_log("openwith tui child pid=%ld", (long)pid);
+
+        if (pid > 0)
+            wait_for_child(pid, &status, "openwith tui");
+
+        if (!redraw_after_child("openwith tui"))
+            return;
+
+        if (pid > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+            set_message("returned");
+        else
+            set_message("openwith tui failed");
+
+        return;
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_message("openwith failed");
+        return;
+    }
+
+    if (pid == 0) {
+        setsid();
+
+        pid_t grandchild = fork();
+        if (grandchild < 0)
+            _exit(127);
+        if (grandchild > 0)
+            _exit(0);
+
+        exec_openwith_detached(arg, full);
+    }
+
+    if (pid > 0)
+        wait_for_child(pid, NULL, "openwith detached");
+
+    if (running)
+        set_message("opened");
+}
+
+static int capture_findmnt(const char *path, char *device, size_t devicesz,
+                           char *mountpoint, size_t mountsz) {
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    struct statfs *mounts;
+    char resolved[PATH_MAX];
+    const char *candidate = realpath(path, resolved) ? resolved : path;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+    int best = -1;
+    size_t best_len = 0;
+
+    for (int i = 0; i < count; i++) {
+        size_t len = strlen(mounts[i].f_mntonname);
+        if (len >= best_len &&
+            strncmp(candidate, mounts[i].f_mntonname, len) == 0 &&
+            (len == 1 || candidate[len] == '\0' || candidate[len] == '/')) {
+            best = i;
+            best_len = len;
+        }
+    }
+    return best >= 0 &&
+           safe_copy(device, devicesz, mounts[best].f_mntfromname) &&
+           safe_copy(mountpoint, mountsz, mounts[best].f_mntonname);
+#else
+    char *argv[] = {
+        "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-T",
+        (char *)path, NULL
+    };
+    char *buf = NULL;
+    int ok = 0;
+
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX * 2 + 31, 250))
+        return 0;
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl) *nl = '\0';
+    char *space = buf;
+    while (*space && *space != ' ' && *space != '\t') space++;
+    if (*space) {
+        *space++ = '\0';
+        while (*space == ' ' || *space == '\t') space++;
+        if (*space)
+            ok = safe_copy(device, devicesz, buf) &&
+                 safe_copy(mountpoint, mountsz, space);
+    }
+    free(buf);
+    return ok;
+#endif
+}
+
+static int capture_exact_mount_device(const char *mountpoint,
+                                      char *device, size_t devicesz) {
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    char actual_mount[PATH_MAX];
+    if (!capture_findmnt(mountpoint, device, devicesz,
+                         actual_mount, sizeof(actual_mount)))
+        return 0;
+    return strcmp(actual_mount, mountpoint) == 0;
+#else
+    char *argv[] = {
+        "findmnt", "-n", "-o", "SOURCE", "--mountpoint",
+        (char *)mountpoint, NULL
+    };
+    char *buf = NULL;
+    int ok = 0;
+
+    if (!mountpoint || !*mountpoint)
+        return 0;
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 31, 250))
+        return 0;
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl) *nl = '\0';
+    if (strncmp(buf, "/dev/", 5) == 0)
+        ok = safe_copy(device, devicesz, buf);
+    free(buf);
+    return ok;
+#endif
+}
+
+#ifdef __FreeBSD__
+static int freebsd_media_mount_path_allowed(const char *path) {
+    const char *run_media = "/run/media/";
+    const char *rest;
+    const char *slash;
+
+    if (!path)
+        return 0;
+    if (strncmp(path, "/media/", 7) == 0 && path[7] != '\0')
+        return 1;
+    if (strncmp(path, run_media, strlen(run_media)) != 0)
+        return 0;
+    rest = path + strlen(run_media);
+    slash = strchr(rest, '/');
+    return slash && slash[1] != '\0';
+}
+
+static int freebsd_exact_automounted_media_device(const char *mountpoint,
+                                                  char *device,
+                                                  size_t devicesz) {
+    struct statfs *mounts;
+    const char *candidate;
+    int count;
+
+    if (!mountpoint || !device || devicesz == 0)
+        return 0;
+    /* realpath(3) touches FreeBSD autofs media mountpoints and can remount a
+     * drive immediately after a successful unmount.  The mount table already
+     * stores the exact media path we need here. */
+    candidate = mountpoint;
+    if (!freebsd_media_mount_path_allowed(candidate))
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(mounts[i].f_mntonname, candidate) != 0)
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            return 0;
+        return safe_copy(device, devicesz, mounts[i].f_mntfromname);
+    }
+    return 0;
+}
+
+static int freebsd_path_is_at_or_below_mount(const char *path,
+                                             const char *mountpoint) {
+    size_t len;
+
+    if (!path || !mountpoint || !mountpoint[0])
+        return 0;
+    if (strcmp(path, mountpoint) == 0)
+        return 1;
+    len = strlen(mountpoint);
+    return strncmp(path, mountpoint, len) == 0 &&
+           (mountpoint[len - 1] == '/' || path[len] == '/');
+}
+
+static int freebsd_containing_automounted_media_mount(const char *path,
+                                                      char *device,
+                                                      size_t devicesz,
+                                                      char *mountpoint,
+                                                      size_t mountsz) {
+    struct statfs *mounts;
+    char resolved[PATH_MAX];
+    const char *candidate;
+    int count;
+    int best = -1;
+    size_t best_len = 0;
+
+    if (!path || !device || devicesz == 0 || !mountpoint || mountsz == 0)
+        return 0;
+    candidate = path;
+    if (strncmp(path, "/media/", 7) != 0)
+        candidate = realpath(path, resolved) ? resolved : path;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        size_t len;
+
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            continue;
+        if (!freebsd_path_is_at_or_below_mount(candidate,
+                                               mounts[i].f_mntonname))
+            continue;
+        len = strlen(mounts[i].f_mntonname);
+        if (len >= best_len) {
+            best = i;
+            best_len = len;
+        }
+    }
+
+    return best >= 0 &&
+           safe_copy(device, devicesz, mounts[best].f_mntfromname) &&
+           safe_copy(mountpoint, mountsz, mounts[best].f_mntonname);
+}
+
+static int freebsd_media_request_parts(const char *requested, char *root,
+                                       size_t rootsz, char *key,
+                                       size_t keysz, const char **rest) {
+    const char *prefix = "/media/";
+    const char *p;
+    const char *slash;
+    size_t key_len;
+
+    if (!requested || strncmp(requested, prefix, strlen(prefix)) != 0)
+        return 0;
+
+    p = requested + strlen(prefix);
+    if (!*p)
+        return 0;
+
+    slash = strchr(p, '/');
+    key_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (key_len == 0 || key_len >= keysz)
+        return 0;
+
+    if (!safe_copy(root, rootsz, "/media"))
+        return 0;
+    memcpy(key, p, key_len);
+    key[key_len] = '\0';
+    if (rest)
+        *rest = slash ? slash : "";
+    return 1;
+}
+
+static int freebsd_lookup_cache_get(FreeBSDLookupCacheEntry *cache, int count,
+                                    const char *key, char *value,
+                                    size_t valuesz, int *found) {
+    if (!cache || !key || !key[0] || !found)
+        return 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(cache[i].key, key) != 0)
+            continue;
+        *found = cache[i].found;
+        if (value && valuesz > 0) {
+            if (cache[i].found)
+                safe_copy(value, valuesz, cache[i].value);
+            else
+                value[0] = '\0';
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void freebsd_lookup_cache_put(FreeBSDLookupCacheEntry *cache,
+                                     int *count, const char *key,
+                                     const char *value, int found) {
+    int index;
+
+    if (!cache || !count || !key || !key[0])
+        return;
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(cache[i].key, key) == 0) {
+            index = i;
+            goto store;
+        }
+    }
+    if (*count >= FREEBSD_LOOKUP_CACHE_MAX)
+        *count = 0;
+    index = (*count)++;
+
+store:
+    safe_copy(cache[index].key, sizeof(cache[index].key), key);
+    cache[index].found = found ? 1 : 0;
+    if (found && value)
+        safe_copy(cache[index].value, sizeof(cache[index].value), value);
+    else
+        cache[index].value[0] = '\0';
+}
+
+static void freebsd_clear_media_lookup_cache(void) {
+    freebsd_fstyp_label_cache_count = 0;
+    freebsd_exact_media_map_cache_count = 0;
+    freebsd_media_map_cache_count = 0;
+    freebsd_geom_provider_cache_count = 0;
+    freebsd_geom_provider_cache_loaded = 0;
+    freebsd_geom_provider_cache_valid = 0;
+}
+
+static int freebsd_capture_fstyp_output(const char *device, char **buf) {
+    char *argv[] = { "/usr/sbin/fstyp", "-l", (char *)device, NULL };
+
+    if (!device || !buf)
+        return 0;
+    return ssp_capture_argv(argv, buf, NAME_MAX + 128, 250);
+}
+
+static int freebsd_fstyp_output_label(char *buf, char *label, size_t labelsz) {
+    char *nl;
+    char *space;
+
+    if (!buf || !label || labelsz == 0)
+        return 0;
+    label[0] = '\0';
+
+    nl = strpbrk(buf, "\r\n");
+    if (nl)
+        *nl = '\0';
+
+    space = buf;
+    while (*space && !isspace((unsigned char)*space))
+        space++;
+    while (*space && isspace((unsigned char)*space))
+        space++;
+    return *space && safe_copy(label, labelsz, space) && label[0];
+}
+
+static int freebsd_capture_fstyp_label(const char *device, char *label,
+                                       size_t labelsz) {
+    char *buf = NULL;
+    int ok = 0;
+    int cached_found;
+
+    if (!device || !label || labelsz == 0)
+        return 0;
+    label[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_fstyp_label_cache,
+                                 freebsd_fstyp_label_cache_count, device,
+                                 label, labelsz, &cached_found))
+        return cached_found;
+
+    if (!freebsd_capture_fstyp_output(device, &buf)) {
+        freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                 &freebsd_fstyp_label_cache_count, device,
+                                 "", 0);
+        return 0;
+    }
+
+    ok = freebsd_fstyp_output_label(buf, label, labelsz);
+    free(buf);
+    freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                             &freebsd_fstyp_label_cache_count, device,
+                             label, ok && label[0]);
+    return ok && label[0];
+}
+
+static int freebsd_media_key_for_label(char *out, size_t outsz,
+                                       const char *label) {
+    size_t len;
+
+    if (!out || outsz == 0 || !label)
+        return 0;
+    out[0] = '\0';
+    len = strlen(label);
+    if (len == 0 || len >= outsz)
+        return 0;
+    for (size_t i = 0; i < len; i++)
+        out[i] = (label[i] == '+' || label[i] == '/') ? '-' : label[i];
+    out[len] = '\0';
+    return 1;
+}
+
+__attribute__((unused)) static int
+freebsd_media_label_matches_key(const char *label, const char *key) {
+    char cleaned[NAME_MAX + 1];
+
+    if (!key || !freebsd_media_key_for_label(cleaned, sizeof(cleaned), label))
+        return 0;
+    return strcmp(cleaned, key) == 0;
+}
+
+static void freebsd_cache_geom_providers(void) {
+    char *confdot;
+    size_t confdot_len = 0;
+    const char *scan;
+
+    if (freebsd_geom_provider_cache_loaded)
+        return;
+    freebsd_geom_provider_cache_loaded = 1;
+
+    if (sysctlbyname("kern.geom.confdot", NULL, &confdot_len, NULL, 0) != 0 ||
+        confdot_len == 0)
+        return;
+    confdot = malloc(confdot_len + 1);
+    if (!confdot)
+        return;
+    if (sysctlbyname("kern.geom.confdot", confdot, &confdot_len, NULL, 0) !=
+        0) {
+        free(confdot);
+        return;
+    }
+    confdot[confdot_len] = '\0';
+    freebsd_geom_provider_cache_valid = 1;
+
+    scan = confdot;
+    while ((scan = strstr(scan, "label=\"")) != NULL) {
+        const char *name_start = scan + strlen("label=\"");
+        const char *label_end = strchr(name_start, '"');
+        const char *name_end = strstr(name_start, "\\n");
+        const char *access_start;
+        const char *access_end;
+        char candidate[NAME_MAX + 1];
+        char device[PATH_MAX];
+        char label[NAME_MAX + 1];
+        char media_key[NAME_MAX + 1];
+        char *fstyp_output = NULL;
+        size_t len;
+        size_t access_len;
+        int cached_found;
+
+        if (!label_end)
+            break;
+        scan = label_end + 1;
+        if (!name_end || name_end > label_end)
+            continue;
+        access_start = name_end + strlen("\\n");
+        access_end = strstr(access_start, "\\n");
+        if (!access_end || access_end > label_end)
+            continue;
+        access_len = (size_t)(access_end - access_start);
+        if (access_len != strlen("r0w0e0") ||
+            strncmp(access_start, "r0w0e0", access_len) != 0)
+            continue;
+        len = (size_t)(name_end - name_start);
+        if (len == 0 || len >= sizeof(candidate))
+            continue;
+        memcpy(candidate, name_start, len);
+        candidate[len] = '\0';
+        if (strchr(candidate, '/'))
+            continue;
+        if (!safe_join3(device, sizeof(device), "/dev/", "", candidate))
+            continue;
+        if (!freebsd_capture_fstyp_output(device, &fstyp_output))
+            continue;
+        if (freebsd_fstyp_output_label(fstyp_output, label, sizeof(label)) &&
+            freebsd_media_key_for_label(media_key, sizeof(media_key), label)) {
+            freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                     &freebsd_fstyp_label_cache_count, device,
+                                     label, 1);
+            if (!freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                          freebsd_geom_provider_cache_count,
+                                          media_key, NULL, 0, &cached_found))
+                freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                                         &freebsd_geom_provider_cache_count,
+                                         media_key, candidate, 1);
+        } else {
+            freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                     &freebsd_fstyp_label_cache_count, device,
+                                     "", 0);
+        }
+        free(fstyp_output);
+        if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                     freebsd_geom_provider_cache_count,
+                                     candidate, NULL, 0, &cached_found))
+            continue;
+        freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                                 &freebsd_geom_provider_cache_count,
+                                 candidate, candidate, 1);
+    }
+
+    free(confdot);
+}
+
+static int freebsd_geom_provider_for_label(const char *key, char *provider,
+                                           size_t providersz) {
+    int cached_found;
+
+    if (!key || !key[0] || !provider || providersz == 0)
+        return 0;
+    provider[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                 freebsd_geom_provider_cache_count, key,
+                                 provider, providersz, &cached_found))
+        return cached_found;
+
+    freebsd_cache_geom_providers();
+    if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                 freebsd_geom_provider_cache_count, key,
+                                 provider, providersz, &cached_found))
+        return cached_found;
+
+    freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                             &freebsd_geom_provider_cache_count, key, "", 0);
+    return 0;
+}
+
+static DriveRecord *freebsd_drive_record_for_device(const char *device) {
+    if (!device || !device[0])
+        return NULL;
+    for (int i = 0; i < drive_count; i++) {
+        if (drives[i].device[0] &&
+            strcmp(drives[i].device, device) == 0)
+            return &drives[i];
+    }
+    return NULL;
+}
+
+static int freebsd_mounted_media_path_for_key(const char *key, char *mountpoint,
+                                              size_t mountsz) {
+    struct statfs *mounts;
+    int count;
+
+    if (!key || !key[0] || !mountpoint || mountsz == 0)
+        return 0;
+
+    for (int i = 0; i < drive_count; i++) {
+        const char *mounted_name;
+
+        if (!drives[i].mounted || !drives[i].mount_path[0] ||
+            !freebsd_media_mount_component(drives[i].mount_path,
+                                            &mounted_name))
+            continue;
+        if ((drives[i].media_key[0] &&
+             strcmp(drives[i].media_key, key) == 0) ||
+            (drives[i].name[0] && strcmp(drives[i].name, key) == 0) ||
+            strcmp(mounted_name, key) == 0)
+            return safe_copy(mountpoint, mountsz, drives[i].mount_path);
+    }
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        DriveRecord *record;
+        const char *provider;
+        char label[NAME_MAX + 1];
+
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            continue;
+
+        provider = base_name(mounts[i].f_mntfromname);
+        if (strcmp(provider, key) == 0)
+            return safe_copy(mountpoint, mountsz, mounts[i].f_mntonname);
+
+        record = freebsd_drive_record_for_device(mounts[i].f_mntfromname);
+        if (record &&
+            ((record->media_key[0] &&
+              strcmp(record->media_key, key) == 0) ||
+             (record->name[0] && strcmp(record->name, key) == 0)))
+            return safe_copy(mountpoint, mountsz, mounts[i].f_mntonname);
+
+        if (freebsd_capture_fstyp_label(mounts[i].f_mntfromname, label,
+                                        sizeof(label)) &&
+            strcmp(label, key) == 0)
+            return safe_copy(mountpoint, mountsz, mounts[i].f_mntonname);
+    }
+
+    return 0;
+}
+
+static int freebsd_media_map_device_for_exact_key(const char *key, char *device,
+                                                  size_t devicesz) {
+    char *argv[] = { "/etc/autofs/special_media", (char *)key, NULL };
+    char *buf = NULL;
+    char *dev;
+    char *end;
+    int ok = 0;
+    int cached_found;
+
+    if (!key || !key[0] || !device || devicesz == 0)
+        return 0;
+    device[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_exact_media_map_cache,
+                                 freebsd_exact_media_map_cache_count, key,
+                                 device, devicesz, &cached_found))
+        return cached_found;
+
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 256, 250)) {
+        freebsd_lookup_cache_put(freebsd_exact_media_map_cache,
+                                 &freebsd_exact_media_map_cache_count, key,
+                                 "", 0);
+        return 0;
+    }
+
+    dev = strstr(buf, ":/dev/");
+    if (dev) {
+        dev++;
+        end = dev;
+        while (*end && !isspace((unsigned char)*end))
+            end++;
+        *end = '\0';
+        ok = safe_copy(device, devicesz, dev);
+    }
+
+    free(buf);
+    freebsd_lookup_cache_put(freebsd_exact_media_map_cache,
+                             &freebsd_exact_media_map_cache_count, key,
+                             device, ok && device[0]);
+    return ok && device[0];
+}
+
+static int freebsd_media_map_device_for_key(const char *key, char *device,
+                                            size_t devicesz) {
+    char provider[NAME_MAX + 1];
+    char provider_path[PATH_MAX];
+    int cached_found;
+
+    if (!key || !key[0] || !device || devicesz == 0)
+        return 0;
+    device[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_media_map_cache,
+                                 freebsd_media_map_cache_count, key,
+                                 device, devicesz, &cached_found))
+        return cached_found;
+
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].device[0])
+            continue;
+        if ((drives[i].media_key[0] &&
+             strcmp(drives[i].media_key, key) == 0) ||
+            (drives[i].name[0] && strcmp(drives[i].name, key) == 0) ||
+            strcmp(base_name(drives[i].device), key) == 0) {
+            safe_copy(device, devicesz, drives[i].device);
+            freebsd_lookup_cache_put(
+                freebsd_media_map_cache, &freebsd_media_map_cache_count,
+                key, device, 1);
+            return 1;
+        }
+    }
+
+    if (freebsd_geom_provider_for_label(key, provider, sizeof(provider)) &&
+        safe_join3(device, devicesz, "/dev/", "", provider)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key,
+                                 device, 1);
+        return 1;
+    }
+
+    if (freebsd_geom_provider_cache_loaded &&
+        freebsd_geom_provider_cache_valid &&
+        (!safe_join3(provider_path, sizeof(provider_path), "/dev/", "", key) ||
+         access(provider_path, F_OK) != 0)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key, "", 0);
+        return 0;
+    }
+
+    if (freebsd_media_map_device_for_exact_key(key, device, devicesz)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key,
+                                 device, 1);
+        return 1;
+    }
+    freebsd_lookup_cache_put(freebsd_media_map_cache,
+                             &freebsd_media_map_cache_count, key, "", 0);
+    return 0;
+}
+
+static int freebsd_media_entry_is_mounted(const char *dir_path,
+                                          const char *name) {
+    struct statfs *mounts;
+    char path[PATH_MAX];
+    int count;
+
+    if (!dir_path || !name || !name[0])
+        return 0;
+    if (!safe_join3(path, sizeof(path), dir_path, "/", name))
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(mounts[i].f_mntonname, path) != 0)
+            continue;
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            return 0;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            return 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int freebsd_media_entry_should_avoid_io(const char *dir_path,
+                                               const char *name,
+                                               char *device,
+                                               size_t devicesz) {
+    if (device && devicesz > 0)
+        device[0] = '\0';
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+    if (freebsd_media_entry_is_mounted(dir_path, name))
+        return 0;
+
+    if (device && devicesz > 0)
+        freebsd_media_map_device_for_key(name, device, devicesz);
+
+    /* FreeBSD autofs media entries mount on lookup.  If a child of /media is
+     * visible but absent from the mount table, drawing details must not stat,
+     * fstatat, or opendir it.  Treat it as a virtual mount request row. */
+    return 1;
+}
+
+static int freebsd_path_is_unmounted_media_tree(const char *path) {
+    char root[PATH_MAX];
+    char key[NAME_MAX + 1];
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+    const char *rest = NULL;
+
+    if (!freebsd_media_request_parts(path, root, sizeof(root), key,
+                                     sizeof(key), &rest))
+        return 0;
+    return !freebsd_containing_automounted_media_mount(
+        path, device, sizeof(device), mountpoint, sizeof(mountpoint));
+}
+
+static int freebsd_media_key_is_labeled_provider_duplicate(
+    const char *key, const char *device) {
+    DriveRecord *record;
+    char label[NAME_MAX + 1];
+    char label_device[PATH_MAX];
+
+    if (!key || !device || strncmp(device, "/dev/", 5) != 0)
+        return 0;
+    if (strcmp(base_name(device), key) != 0)
+        return 0;
+    record = freebsd_drive_record_for_device(device);
+    if (record)
+        return record->media_key[0] &&
+               strcmp(record->media_key, key) != 0;
+    if (!freebsd_capture_fstyp_label(device, label, sizeof(label)))
+        return 0;
+    if (strcmp(label, key) == 0)
+        return 0;
+    if (!freebsd_media_map_device_for_key(label, label_device,
+                                          sizeof(label_device)))
+        return 0;
+    return same_device_path(device, label_device);
+}
+
+static int freebsd_media_key_needs_provider_path(const char *key) {
+    if (!key || !key[0])
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        if (isspace(*p))
+            return 1;
+    }
+    return 0;
+}
+
+static int freebsd_resolve_media_alias(char *out, size_t outsz,
+                                       const char *requested) {
+    DriveRecord *record;
+    char root[PATH_MAX];
+    char key[NAME_MAX + 1];
+    char label[NAME_MAX + 1];
+    char mountpoint[PATH_MAX];
+    char device[PATH_MAX];
+    char provider_path[PATH_MAX];
+    char resolved[PATH_MAX];
+    const char *friendly_label = NULL;
+    const char *rest = "";
+
+    if (!out || outsz == 0 ||
+        !freebsd_media_request_parts(requested, root, sizeof(root), key,
+                                     sizeof(key), &rest))
+        return 0;
+
+    if (freebsd_mounted_media_path_for_key(key, mountpoint,
+                                           sizeof(mountpoint))) {
+        if (!safe_join3(resolved, sizeof(resolved), mountpoint, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    if (!freebsd_media_map_device_for_key(key, device, sizeof(device)))
+        return 0;
+
+    if (!safe_join3(provider_path, sizeof(provider_path), root, "/",
+                    base_name(device)))
+        return 0;
+
+    record = freebsd_drive_record_for_device(device);
+    if (record && record->name[0])
+        friendly_label = record->name;
+    else if (freebsd_capture_fstyp_label(device, label, sizeof(label)))
+        friendly_label = label;
+
+    if (friendly_label && strcmp(friendly_label, key) != 0 &&
+        !freebsd_media_key_needs_provider_path(friendly_label)) {
+        char label_path[PATH_MAX];
+
+        if (!safe_join3(label_path, sizeof(label_path), root, "/",
+                        friendly_label))
+            return 0;
+        if (!safe_join3(resolved, sizeof(resolved), label_path, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    if (freebsd_media_key_needs_provider_path(key)) {
+        if (!safe_join3(resolved, sizeof(resolved), provider_path, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    return 0;
+}
+
+static int freebsd_media_root_is_autofs(void) {
+    struct statfs *mounts;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(mounts[i].f_mntonname, "/media") == 0 &&
+            strcmp(mounts[i].f_fstypename, "autofs") == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int freebsd_media_mount_component(const char *mountpoint,
+                                         const char **component) {
+    const char *prefix = "/media/";
+    const char *name;
+
+    if (!mountpoint || strncmp(mountpoint, prefix, strlen(prefix)) != 0)
+        return 0;
+    name = mountpoint + strlen(prefix);
+    if (!name[0] || strchr(name, '/'))
+        return 0;
+    if (component)
+        *component = name;
+    return 1;
+}
+
+static int freebsd_drive_index_for_mount(const char *mountpoint,
+                                         const char *device) {
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].mounted)
+            continue;
+        if ((mountpoint && drives[i].mount_path[0] &&
+             strcmp(drives[i].mount_path, mountpoint) == 0) ||
+            (device && drives[i].device[0] &&
+             strcmp(drives[i].device, device) == 0))
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * /media is an autofs trigger tree on FreeBSD.  Reading its placeholder
+ * directories and resolving each label can launch special_media, fstyp, and
+ * GEOM work during an ordinary redraw.  Build that one directory from the
+ * already-cached GIO snapshot and mount table instead.  Stale autofs
+ * placeholders disappear without ever being touched.
+ */
+static int freebsd_build_media_entries(Entry *target, int capacity,
+                                       const char *context) {
+    struct statfs *mounts;
+    int count = 0;
+    int mount_count;
+
+    if (!target || capacity <= 0 || !freebsd_media_root_is_autofs())
+        return -1;
+
+    mount_count = getmntinfo(&mounts, MNT_NOWAIT);
+    for (int i = 0; i < mount_count && count < capacity; i++) {
+        const char *name;
+
+        if (!freebsd_media_mount_component(mounts[i].f_mntonname, &name) ||
+            strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0 ||
+            entry_name_exists(target, count, name))
+            continue;
+
+        safe_copy(target[count].name, sizeof(target[count].name), name);
+        target[count].is_dir = 1;
+        target[count].kind = ENTRY_FILESYSTEM;
+        target[count].drive_index = freebsd_drive_index_for_mount(
+            mounts[i].f_mntonname, mounts[i].f_mntfromname);
+        debug_log("%s entry insert source=mount-table index=%d "
+                  "name=\"%s\" device=\"%s\"",
+                  context ? context : "listing", count, name,
+                  mounts[i].f_mntfromname);
+        count++;
+    }
+
+    for (int i = 0; i < drive_count && count < capacity; i++) {
+        const char *name;
+
+        if (!drives[i].removable || !drives[i].mounted ||
+            !freebsd_media_mount_component(drives[i].mount_path, &name) ||
+            entry_name_exists(target, count, name))
+            continue;
+        safe_copy(target[count].name, sizeof(target[count].name), name);
+        target[count].is_dir = 1;
+        target[count].kind = ENTRY_FILESYSTEM;
+        target[count].drive_index = i;
+        count++;
+    }
+
+    count = append_unmounted_drives_from_snapshot(
+        target, count, capacity, drives, drive_count,
+        context ? context : "listing", 1);
+    qsort(target, (size_t)count, sizeof(Entry), cmp_entries);
+    return count;
+}
+
+static int freebsd_should_hide_media_entry(const char *dir_path,
+                                           const char *name) {
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+
+    if (freebsd_mounted_media_path_for_key(name, mountpoint,
+                                           sizeof(mountpoint)))
+        return 0;
+    if (!freebsd_media_map_device_for_key(name, device, sizeof(device)))
+        return 1;
+    return freebsd_media_key_is_labeled_provider_duplicate(name, device);
+}
+
+static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
+                                                const char *name) {
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+    if (freebsd_mounted_media_path_for_key(name, mountpoint,
+                                           sizeof(mountpoint)))
+        return 0;
+    if (!freebsd_media_map_device_for_key(name, device, sizeof(device)))
+        return 0;
+    return !freebsd_media_key_is_labeled_provider_duplicate(name, device);
+}
+
+static int freebsd_display_media_path(char *out, size_t outsz,
+                                      const char *path) {
+    DriveRecord *record;
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+    char label_path[PATH_MAX];
+    const char *label;
+    const char *rest;
+    size_t mount_len;
+
+    if (!out || outsz == 0 || !path ||
+        strncmp(path, "/media/", 7) != 0)
+        return 0;
+    if (!freebsd_containing_automounted_media_mount(
+            path, device, sizeof(device), mountpoint, sizeof(mountpoint)))
+        return 0;
+    if (strncmp(mountpoint, "/media/", 7) != 0)
+        return 0;
+    record = freebsd_drive_record_for_device(device);
+    if (!record || !record->name[0])
+        return 0;
+    label = record->name;
+    if (strcmp(label, base_name(mountpoint)) == 0)
+        return 0;
+
+    mount_len = strlen(mountpoint);
+    if (strncmp(path, mountpoint, mount_len) != 0)
+        return 0;
+    rest = path + mount_len;
+    if (*rest && *rest != '/')
+        return 0;
+
+    if (!safe_join3(label_path, sizeof(label_path), "/media/", "", label))
+        return 0;
+    return safe_join3(out, outsz, label_path, "", rest);
+}
+
+static int freebsd_start_media_mount(const char *path, const char *device,
+                                     const char *drive_id,
+                                     const char *display_name) {
+    pid_t pid;
+
+    if (!path || strncmp(path, "/media/", 7) != 0 ||
+        !device || strncmp(device, "/dev/", 5) != 0)
+        return 0;
+    if (!file_operation_can_start())
+        return 0;
+
+    pid = fork();
+    if (pid == 0) {
+        char mounted_device[PATH_MAX];
+        struct statvfs filesystem;
+
+        redirect_background_stdio();
+
+        /*
+         * First use the host's normal autofs lookup, which is the fast path
+         * desktop file managers get when they open /media/<label>.  Verify
+         * both identity and read-write state before reporting success.  The
+         * privileged helper is only the repair/recovery fallback.
+         */
+        if (chdir(path) == 0) {
+            DIR *trigger = opendir(".");
+
+            if (trigger) {
+                (void)readdir(trigger);
+                closedir(trigger);
+            }
+            if (freebsd_exact_automounted_media_device(
+                    path, mounted_device, sizeof(mounted_device)) &&
+                same_device_path(mounted_device, device) &&
+                statvfs(path, &filesystem) == 0 &&
+                (filesystem.f_flag & ST_RDONLY) == 0)
+                _exit(0);
+        }
+        if (chdir("/") != 0)
+            _exit(127);
+
+        if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
+            execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
+                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path, device,
+                  (char *)NULL);
+        if (ssp_command_available(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER))
+            execlp(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER,
+                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path, device,
+                   (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        set_message("mount failed: could not start");
+        return 0;
+    }
+
+    remember_file_operation(pid, FILE_OPERATION_MOUNT, cwd_path,
+                            display_name ? display_name : "");
+    safe_copy(file_operation_path, sizeof(file_operation_path), path);
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              drive_id ? drive_id : "");
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id),
+              drive_id ? drive_id : "");
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    set_message("mounting drive");
+    debug_log("mount child pid=%ld path=%s device=%s id=%s",
+              (long)pid, path, device, file_operation_drive_id);
+    return 1;
+}
+
+static int freebsd_mount_request_for_entry(const Entry *entry,
+                                           char *mount_path,
+                                           size_t mount_path_size,
+                                           char *device,
+                                           size_t device_size,
+                                           char *drive_id,
+                                           size_t drive_id_size) {
+    DriveRecord *record;
+    char mount_key[NAME_MAX + 1];
+
+    if (!entry || !mount_path || mount_path_size == 0 ||
+        !device || device_size == 0 || !drive_id || drive_id_size == 0)
+        return 0;
+    mount_path[0] = '\0';
+    device[0] = '\0';
+    drive_id[0] = '\0';
+    mount_key[0] = '\0';
+    record = entry_drive_record(entry);
+
+    if (record) {
+        safe_copy(device, device_size, record->device);
+        safe_copy(drive_id, drive_id_size, record->id);
+        safe_copy(mount_key, sizeof(mount_key),
+                  record->media_key[0] ? record->media_key :
+                                         base_name(record->device));
+        /*
+         * A device-qualified display suffix means another attached filesystem
+         * already owns the label key.  The provider key gives this one a
+         * distinct mountpoint without ever treating the display name as an
+         * action identifier.
+         */
+        if (strcmp(entry->name, record->name) != 0)
+            safe_copy(mount_key, sizeof(mount_key),
+                      base_name(record->device));
+    } else {
+        safe_copy(mount_key, sizeof(mount_key), entry->name);
+        freebsd_media_map_device_for_key(mount_key, device, device_size);
+    }
+
+    return mount_key[0] && device[0] &&
+           safe_join3(mount_path, mount_path_size, "/media/", "",
+                      mount_key);
+}
+
+static void set_freebsd_mount_failure_message(int exit_code) {
+    switch (exit_code) {
+    case 64:
+        set_message("mount failed: update helper");
+        break;
+    case 65:
+        set_message("mount blocked: drive repair failed; left unmounted");
+        break;
+    case 69:
+        set_message("mount failed: not recognized media");
+        break;
+    case 71:
+        set_message("mount failed: system mount failed");
+        break;
+    case 73:
+        set_message("mount failed: cannot create mountpoint");
+        break;
+    case 75:
+        set_message("mount failed: drive is busy");
+        break;
+    case 77:
+        set_message("mount failed: helper not privileged");
+        break;
+    case 78:
+        set_message("mount blocked: filesystem repair tool unavailable");
+        break;
+    case 126:
+        set_message("mount failed: helper could not run");
+        break;
+    case 127:
+        set_message("mount failed: helper not installed");
+        break;
+    default:
+        set_message("mount failed");
+        break;
+    }
+}
+#endif
+
+static int same_device_path(const char *a, const char *b) {
+    char real_a[PATH_MAX];
+    char real_b[PATH_MAX];
+    const char *cmp_a;
+    const char *cmp_b;
+
+    if (!a || !b)
+        return 0;
+    cmp_a = realpath(a, real_a) ? real_a : a;
+    cmp_b = realpath(b, real_b) ? real_b : b;
+    return strcmp(cmp_a, cmp_b) == 0;
+}
+
+static DriveRecord *mounted_drive_at_path(const char *path) {
+    char requested[PATH_MAX];
+
+    if (!path)
+        return NULL;
+    if (!realpath(path, requested) &&
+        !safe_copy(requested, sizeof(requested), path))
+        return NULL;
+
+    for (int i = 0; i < drive_count; i++) {
+        char mounted[PATH_MAX];
+
+        if (!drives[i].mounted || !drives[i].mount_path[0])
+            continue;
+        if (!realpath(drives[i].mount_path, mounted))
+            safe_copy(mounted, sizeof(mounted), drives[i].mount_path);
+        if (strcmp(requested, mounted) == 0)
+            return &drives[i];
+    }
+    return NULL;
+}
+
+static DriveRecord *mounted_drive_at_exact_path(const char *path) {
+    if (!path || !path[0])
+        return NULL;
+    for (int i = 0; i < drive_count; i++) {
+        if (drives[i].mounted && drives[i].mount_path[0] &&
+            strcmp(drives[i].mount_path, path) == 0)
+            return &drives[i];
+    }
+    return NULL;
+}
+
+static int path_is_at_or_below(const char *path, const char *parent) {
+    size_t len;
+
+    if (!path || !parent || !parent[0])
+        return 0;
+    if (strcmp(path, parent) == 0)
+        return 1;
+    len = strlen(parent);
+    return strncmp(path, parent, len) == 0 &&
+           (parent[len - 1] == '/' || path[len] == '/');
+}
+
+static DriveRecord *mounted_drive_containing_path(const char *path) {
+    DriveRecord *best = NULL;
+
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].mounted || !drives[i].mount_path[0] ||
+            !path_is_at_or_below(path, drives[i].mount_path))
+            continue;
+        if (!best || strlen(drives[i].mount_path) > strlen(best->mount_path))
+            best = &drives[i];
+    }
+    return best;
+}
+
+static void command_unmount(void) {
+#ifndef __FreeBSD__
+    DriveRecord *record;
+#ifndef __APPLE__
+    int has_udisksctl;
+#endif
+
+    if (!file_operation_can_start())
+        return;
+    if (entry_count <= 0) {
+        set_message("nothing selected");
+        return;
+    }
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+
+    struct stat st;
+    if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        set_message("not a directory");
+        return;
+    }
+
+    record = mounted_drive_at_path(full);
+    if (!record) {
+        set_message("select a mounted removable drive");
+        return;
+    }
+
+    char device[PATH_MAX];
+    if (!capture_exact_mount_device(full, device, sizeof(device))) {
+        set_message("select the drive's mount directory itself");
+        return;
+    }
+    if (!same_device_path(device, record->device)) {
+        drive_state_dirty = 1;
+        set_message("drive changed; reload before unmounting");
+        return;
+    }
+
+    char root_device[PATH_MAX], root_mount[PATH_MAX];
+    if (capture_findmnt("/", root_device, sizeof(root_device),
+                        root_mount, sizeof(root_mount))) {
+        if (same_device_path(device, root_device)) {
+            set_message("refusing to unmount the system device");
+            return;
+        }
+    }
+
+    cancel_media_workers_for_unmount();
+#ifndef __APPLE__
+    has_udisksctl = ssp_command_available("udisksctl");
+#endif
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+                close(devnull);
+        }
+
+#ifdef __APPLE__
+        execl("/usr/sbin/diskutil", "diskutil", "unmount", device,
+              (char *)NULL);
+#else
+        /* GIO and udisksctl ultimately request the same UDisks filesystem
+         * unmount.  Use udisksctl directly for a block device, with a plain
+         * exact-mountpoint fallback on systems that do not ship UDisks. */
+        if (has_udisksctl)
+            execlp("udisksctl", "udisksctl", "unmount", "-b", device,
+                   (char *)NULL);
+
+        execlp("umount", "umount", "--", full, (char *)NULL);
+#endif
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0) {
+        set_message("unmount failed: could not start");
+        return;
+    }
+
+    remember_file_operation(pid, FILE_OPERATION_UNMOUNT, cwd_path,
+                            base_name(full));
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              record->id);
+#ifdef __APPLE__
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
+#endif
+    set_message("unmounting drive in background");
+#else
+    DriveRecord *record;
+    int drive_record_required = 1;
+
+    if (!file_operation_can_start())
+        return;
+    if (entry_count <= 0) {
+        set_message("nothing selected");
+        return;
+    }
+
+    char full[PATH_MAX];
+    char operation_dir[PATH_MAX];
+    int selected_is_dir;
+    int unmount_current_media = 0;
+    join_path(full, cwd_path, entries[cursor].name);
+    if (strcmp(cwd_path, "/media") == 0 &&
+        !freebsd_media_entry_is_mounted(cwd_path, entries[cursor].name)) {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_map_device_for_key(entries[cursor].name,
+                                             media_device,
+                                             sizeof(media_device))) {
+            set_message("drive is not mounted");
+            return;
+        }
+    }
+    {
+        char resolved_full[PATH_MAX];
+        if (resolve_media_directory(resolved_full, sizeof(resolved_full),
+                                    full))
+            safe_copy(full, sizeof(full), resolved_full);
+    }
+
+    struct stat st;
+    selected_is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+
+    char device[PATH_MAX];
+    device[0] = '\0';
+
+    safe_copy(operation_dir, sizeof(operation_dir), cwd_path);
+    record = selected_is_dir ? mounted_drive_at_path(full) : NULL;
+    if (selected_is_dir && !record &&
+        freebsd_exact_automounted_media_device(full, device, sizeof(device))) {
+        drive_record_required = 0;
+        debug_log("unmount using FreeBSD automounted media fallback path=%s "
+                  "device=%s", full, device);
+    }
+    if (!record && device[0] == '\0') {
+        char mountpoint[PATH_MAX];
+
+        if (freebsd_containing_automounted_media_mount(
+                cwd_path, device, sizeof(device), mountpoint,
+                sizeof(mountpoint))) {
+            if (!safe_copy(full, sizeof(full), mountpoint)) {
+                set_message("unmount failed: path too long");
+                return;
+            }
+            drive_record_required = 0;
+            unmount_current_media = 1;
+            debug_log("unmount using FreeBSD current media fallback cwd=%s "
+                      "mount=%s device=%s", cwd_path, full, device);
+        }
+    }
+    if (drive_record_required && !record) {
+        if (!selected_is_dir)
+            set_message("not a directory");
+        else
+            set_message("select a mounted removable drive");
+        return;
+    }
+    if (!selected_is_dir && !unmount_current_media) {
+        set_message("not a directory");
+        return;
+    }
+    if (unmount_current_media && !recover_to_existing_parent(full)) {
+        set_message("cannot leave drive before unmounting");
+        return;
+    }
+    if (unmount_current_media)
+        safe_copy(operation_dir, sizeof(operation_dir), cwd_path);
+
+    if (!device[0] && !capture_exact_mount_device(full, device, sizeof(device))) {
+        set_message("select the drive's mount directory itself");
+        return;
+    }
+    if (record && !same_device_path(device, record->device)) {
+        drive_state_dirty = 1;
+        set_message("drive changed; reload before unmounting");
+        return;
+    }
+
+    char root_device[PATH_MAX], root_mount[PATH_MAX];
+    if (capture_findmnt("/", root_device, sizeof(root_device),
+                        root_mount, sizeof(root_mount))) {
+        if (same_device_path(device, root_device)) {
+            set_message("refusing to unmount the system device");
+            return;
+        }
+    }
+
+    cancel_media_workers_for_unmount();
+    debug_log("unmount command cwd=%s full=%s entry=%s selected_is_dir=%d "
+              "device=%s record=%s current_media=%d",
+              cwd_path, full, entries[cursor].name, selected_is_dir, device,
+              record ? record->id : "", unmount_current_media);
+
+    if (!unmount_current_media && strcmp(cwd_path, "/media") == 0 &&
+        strncmp(full, "/media/", 7) == 0 && chdir("/") != 0) {
+        set_message("cannot leave media before unmounting");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+                close(devnull);
+        }
+
+        /* GIO and udisksctl ultimately request the same UDisks filesystem
+         * unmount.  Use udisksctl directly for a block device, with a plain
+         * exact-mountpoint fallback on systems that do not ship UDisks. */
+        if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
+            execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
+                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, full, (char *)NULL);
+        if (ssp_command_available(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER))
+            execlp(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER,
+                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, full, (char *)NULL);
+        execlp("umount", "umount", full, (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0) {
+        set_message("unmount failed: could not start");
+        return;
+    }
+
+    remember_file_operation(pid, FILE_OPERATION_UNMOUNT, operation_dir,
+                            base_name(full));
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
+    debug_log("unmount child pid=%ld operation_dir=%s target=%s",
+              (long)pid, operation_dir, base_name(full));
+    if (record) {
+        safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+                  record->id);
+    } else {
+        file_operation_drive_id[0] = '\0';
+    }
+    set_message("unmounting drive in background");
+#endif
+}
+
+static void set_unmount_failure_message(int status) {
+#ifdef __FreeBSD__
+    if (WIFEXITED(status)) {
+        switch (WEXITSTATUS(status)) {
+        case SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST:
+            set_message("unmount failed: bad helper request");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA:
+            set_message("unmount failed: not automounted media");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_BUSY:
+            set_message("unmount failed: drive is busy");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED:
+            set_message("unmount failed: helper not privileged");
+            return;
+        default:
+            break;
+        }
+    }
+#else
+    (void)status;
+#endif
+    set_message("unmount failed");
+}
+
+static int check_background_file_operation(void) {
+    int status = 0;
+    pid_t result;
+    FileOperationKind kind;
+    int same_directory;
+    int succeeded;
+
+    if (file_operation_pid <= 0)
+        return 0;
+    do {
+        result = waitpid(file_operation_pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+        return 0;
+
+    kind = file_operation_kind;
+    same_directory = strcmp(cwd_path, file_operation_directory) == 0;
+    succeeded = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (kind == FILE_OPERATION_UNMOUNT && succeeded) {
+        char completed_mount[PATH_MAX];
+        char mounted_device[PATH_MAX];
+
+        if (safe_join3(completed_mount, sizeof(completed_mount),
+                       file_operation_directory, "/",
+                       file_operation_target) &&
+            capture_exact_mount_device(completed_mount, mounted_device,
+                                       sizeof(mounted_device))) {
+            debug_log("unmount target still mounted path=%s device=%s",
+                      completed_mount, mounted_device);
+            succeeded = 0;
+        }
+    }
+#ifdef __FreeBSD__
+    debug_log("file operation finished kind=%d result=%ld status=%d "
+              "exited=%d exit=%d signaled=%d signal=%d dir=%s target=%s "
+              "same_dir=%d initial_success=%d",
+              kind, (long)result, status, WIFEXITED(status),
+              WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+              WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+              file_operation_directory, file_operation_target, same_directory,
+              succeeded);
+    if (kind == FILE_OPERATION_MOUNT && succeeded) {
+        char mounted_device[PATH_MAX];
+
+        if (!file_operation_path[0] ||
+            !freebsd_exact_automounted_media_device(
+                file_operation_path, mounted_device,
+                sizeof(mounted_device)) ||
+            !same_device_path(mounted_device, file_operation_device)) {
+            debug_log("mount helper exited successfully but path is not "
+                      "mounted path=%s", file_operation_path);
+            succeeded = 0;
+        }
+    }
+#endif
+    file_operation_pid = -1;
+    file_operation_kind = FILE_OPERATION_NONE;
+
+#ifdef __APPLE__
+    if (kind == FILE_OPERATION_MOUNT) {
+        char completed_path[PATH_MAX] = "";
+
+        mounting_drive_id[0] = '\0';
+        mounting_drive_activity[0] = '\0';
+        refresh_drive_snapshot();
+        if (succeeded) {
+            for (int attempt = 0; attempt < 20 && !completed_path[0];
+                 attempt++) {
+                for (int i = 0; i < drive_count; i++) {
+                    if (strcmp(drives[i].id, file_operation_drive_id) == 0 &&
+                        drives[i].mounted && drives[i].mount_path[0]) {
+                        safe_copy(completed_path, sizeof(completed_path),
+                                  drives[i].mount_path);
+                        break;
+                    }
+                }
+                if (!completed_path[0] && attempt + 1 < 20) {
+                    sui_sleep_ms(100);
+                    refresh_drive_snapshot();
+                }
+            }
+            if (!completed_path[0])
+                succeeded = 0;
+        }
+        if (succeeded && same_directory) {
+            remember_current_cursor();
+            if (chdir(completed_path) == 0) {
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), completed_path);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                set_message("drive mounted");
+            } else {
+                char failure[256];
+
+                snprintf(failure, sizeof(failure),
+                         "drive mounted but unavailable: %s",
+                         strerror(errno));
+                set_message(failure);
+            }
+        } else if (succeeded) {
+            set_message("drive mounted");
+        } else if (result < 0) {
+            set_message("background mount ended oddly");
+        } else {
+            set_message("mount failed: diskutil could not mount the volume");
+            if (same_directory)
+                load_dir(cwd_path);
+        }
+        file_operation_directory[0] = '\0';
+        file_operation_target[0] = '\0';
+        file_operation_drive_id[0] = '\0';
+        file_operation_path[0] = '\0';
+        file_operation_device[0] = '\0';
+        return 1;
+    }
+#endif
+
+#ifdef __FreeBSD__
+    if (kind == FILE_OPERATION_MOUNT) {
+        char completed_path[PATH_MAX];
+
+        safe_copy(completed_path, sizeof(completed_path),
+                  file_operation_path);
+        mounting_drive_id[0] = '\0';
+        mounting_drive_activity[0] = '\0';
+        freebsd_clear_media_lookup_cache();
+        refresh_drive_snapshot();
+
+        if (succeeded && same_directory) {
+            remember_current_cursor();
+            if (chdir(completed_path) == 0) {
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), completed_path);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                restore_dir_cursor(cwd_path);
+                set_message("drive mounted");
+            } else {
+                char failure[256];
+                snprintf(failure, sizeof(failure),
+                         "drive mounted but unavailable: %s",
+                         strerror(errno));
+                set_message(failure);
+            }
+        } else if (succeeded) {
+            set_message("drive mounted");
+        } else {
+            if (same_directory)
+                load_dir(cwd_path);
+            if (result < 0)
+                set_message("background mount ended oddly");
+            else if (WIFEXITED(status))
+                set_freebsd_mount_failure_message(WEXITSTATUS(status));
+            else
+                set_message("mount failed");
+        }
+
+        file_operation_directory[0] = '\0';
+        file_operation_target[0] = '\0';
+        file_operation_drive_id[0] = '\0';
+        file_operation_path[0] = '\0';
+        file_operation_device[0] = '\0';
+        return 1;
+    }
+#endif
+
+    if (kind == FILE_OPERATION_UNMOUNT) {
+        /*
+         * An attached filesystem remains discoverable after a successful
+         * unmount.  Reloading the snapshot converts its row back to the
+         * ordinary Enter/Right-to-mount state on every supported OS.
+         */
+        while (g_main_context_pending(NULL))
+            g_main_context_iteration(NULL, FALSE);
+        refresh_drive_snapshot();
+        if (succeeded) {
+            mark_attached_drive_unmounted(file_operation_drive_id);
+#ifdef __FreeBSD__
+            mark_attached_device_unmounted(file_operation_device);
+#endif
+        }
+    }
+    /* Emptying trash does not change the displayed source directory.  A
+     * refresh here can itself block on the share we just deferred. */
+    if (same_directory && kind != FILE_OPERATION_EMPTY_TRASH)
+        load_dir(cwd_path);
+
+    if (result < 0) {
+        set_message("background operation ended oddly");
+#if defined(__APPLE__)
+    } else if (succeeded) {
+        if (same_directory && file_operation_target[0])
+            set_cursor_to_name(file_operation_target);
+#elif !defined(__FreeBSD__)
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (same_directory && file_operation_target[0])
+            set_cursor_to_name(file_operation_target);
+#else
+    } else if (succeeded) {
+        if (same_directory && file_operation_target[0] &&
+            kind != FILE_OPERATION_UNMOUNT)
+            set_cursor_to_name(file_operation_target);
+#endif
+        if (kind == FILE_OPERATION_COMPRESS)
+            set_message("compressed");
+        else if (kind == FILE_OPERATION_EXTRACT)
+            set_message("extracted");
+        else if (kind == FILE_OPERATION_EMPTY_TRASH)
+            set_message("trash emptied");
+        else
+            set_message("drive unmounted");
+#ifdef __FreeBSD__
+    } else if (kind == FILE_OPERATION_UNMOUNT && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 0) {
+        set_message("unmount failed: still mounted");
+#endif
+#ifdef __linux__
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
+               (WEXITSTATUS(status) == TRASH_DEFERRED ||
+                WEXITSTATUS(status) == TRASH_DEFERRED_FAILED)) {
+        set_message(WEXITSTATUS(status) == TRASH_DEFERRED ?
+                    "reachable trash emptied; unavailable trash deferred" :
+                    "trash partly emptied; some failed or were deferred");
+#endif
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 2) {
+        set_message("trash partly emptied; some failed");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        if (kind == FILE_OPERATION_COMPRESS)
+            set_message("compress failed: zip not found");
+        else if (kind == FILE_OPERATION_EXTRACT)
+            set_message("extract failed: tool not found");
+        else if (kind == FILE_OPERATION_EMPTY_TRASH)
+#ifdef __APPLE__
+            set_message("empty trash failed: macOS helper not found");
+#else
+            set_message("empty trash failed: gio not found");
+#endif
+        else
+            set_message("unmount failed: no unmount tool");
+    } else if (kind == FILE_OPERATION_COMPRESS) {
+        set_message("compress failed");
+    } else if (kind == FILE_OPERATION_EXTRACT) {
+        set_message("extract failed");
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH) {
+        set_message("empty trash failed");
+    } else {
+        set_unmount_failure_message(status);
+    }
+
+    file_operation_directory[0] = '\0';
+    file_operation_target[0] = '\0';
+    file_operation_drive_id[0] = '\0';
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    file_operation_path[0] = '\0';
+    file_operation_device[0] = '\0';
+#endif
+    return 1;
+}
+
+
+static void execute_command(const char *raw, const char *command_entry) {
+    const char *cmd = skip_spaces(raw);
+
+    if (cmd[0] == '\0') {
+        set_message("");
+        return;
+    }
+
+#ifdef __FreeBSD__
+    if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
+        strcmp(cmd, "unmount") == 0) {
+        set_message("drive is not mounted");
+        return;
+    }
+
+    if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
+        ((selected_count == 0 && (strcmp(cmd, "delete") == 0 ||
+                                  strcmp(cmd, "delete!") == 0)) ||
+         strncmp(cmd, "rename ", 7) == 0 ||
+         (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
+         strncmp(cmd, "openwith ", 9) == 0 ||
+         strcmp(cmd, "extract") == 0)) {
+        set_message("press Enter or Right to mount the drive first");
+        return;
+    }
+#else
+    if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
+        ((selected_count == 0 && (strcmp(cmd, "delete") == 0 ||
+                                  strcmp(cmd, "delete!") == 0)) ||
+         strncmp(cmd, "rename ", 7) == 0 ||
+         (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
+         strncmp(cmd, "openwith ", 9) == 0 ||
+         strcmp(cmd, "extract") == 0 ||
+         strcmp(cmd, "unmount") == 0)) {
+        set_message("press Enter or Right to mount the drive first");
+        return;
+    }
+#endif
+
+    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "quit") == 0) {
+        exit_reason = "q";
+        running = 0;
+        return;
+    }
+
+    if (strcmp(cmd, "reload") == 0 || strcmp(cmd, "redraw") == 0) {
+        load_dir(cwd_path);
+        clearok(stdscr, TRUE);
+        set_message("reloaded");
+        return;
+    }
+
+    if (strcmp(cmd, "hidden") == 0) {
+        show_hidden = !show_hidden;
+        load_dir(cwd_path);
+        set_message(show_hidden ? "hidden files shown" : "hidden files hidden");
+        return;
+    }
+
+    if (strcmp(cmd, "emptytrash") == 0) {
+        pending_empty_trash = 1;
+        set_message("empty trash permanently? y/N");
+        return;
+    }
+
+    if (strcmp(cmd, "delete") == 0) {
+        arm_delete();
+        return;
+    }
+
+    if (strcmp(cmd, "delete!") == 0) {
+        if (selected_count <= 0 && entry_count <= 0) {
+            set_message("nothing to delete");
+            return;
+        }
+        pending_permanent_delete = 1;
+        set_message("PERMANENTLY delete with authorization? y/N");
+        return;
+    }
+
+    if (strncmp(cmd, "cd ", 3) == 0) {
+        command_cd(cmd + 3);
+        return;
+    }
+
+    if (strncmp(cmd, "mkdir ", 6) == 0) {
+        command_mkdir(cmd + 6);
+        return;
+    }
+
+    if (strncmp(cmd, "rename ", 7) == 0) {
+        command_rename(cmd + 7, command_entry);
+        return;
+    }
+
+    if (strncmp(cmd, "compress ", 9) == 0) {
+        command_compress(cmd + 9);
+        return;
+    }
+
+    if (strncmp(cmd, "openwith ", 9) == 0) {
+        command_openwith(cmd + 9);
+        return;
+    }
+
+    if (strcmp(cmd, "extract") == 0) {
+        command_extract();
+        return;
+    }
+
+    if (strcmp(cmd, "unmount") == 0) {
+        command_unmount();
+        return;
+    }
+
+    set_message("unknown command");
+}
+
+static int recover_to_existing_parent(const char *path) {
+    char candidate[PATH_MAX];
+
+    if (!path || path[0] != '/' || !safe_copy(candidate, sizeof(candidate), path))
+        return 0;
+    while (candidate[1] != '\0') {
+        char *slash;
+        size_t len = strlen(candidate);
+
+        while (len > 1 && candidate[len - 1] == '/')
+            candidate[--len] = '\0';
+        slash = strrchr(candidate, '/');
+        if (!slash)
+            return 0;
+        if (slash == candidate)
+            candidate[1] = '\0';
+        else
+            *slash = '\0';
+
+        if (network_ui_path(candidate))
+            return network_change_directory(candidate);
+        if (chdir(candidate) == 0) {
+            if (!getcwd(cwd_path, sizeof(cwd_path)))
+                safe_copy(cwd_path, sizeof(cwd_path), candidate);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void load_dir(const char *path) {
+    char listing_path[PATH_MAX];
+    char resolved_path[PATH_MAX];
+    int count;
+    int open_error;
+
+    directory_listing_generation++;
+    cancel_directory_type_worker();
+    safe_copy(listing_path, sizeof(listing_path), path ? path : "");
+    debug_log("load_dir begin requested_path=\"%s\" cwd_path=\"%s\"",
+              path ? path : "", cwd_path);
+
+    /* Only exact media boundaries can alias between distribution layouts. */
+    if (resolve_media_directory(resolved_path, sizeof(resolved_path),
+                                listing_path) &&
+        strcmp(resolved_path, listing_path) != 0 &&
+        chdir(resolved_path) == 0) {
+        if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), resolved_path);
+        safe_copy(listing_path, sizeof(listing_path), cwd_path);
+    }
+
+    count = build_directory_entries(listing_path, entries, MAX_ENTRIES,
+                                    "current-pane");
+    open_error = errno;
+    if (count < 0 && !network_ui_path(listing_path) &&
+        strcmp(listing_path, cwd_path) == 0 &&
+        (open_error == ENOENT || open_error == ENOTDIR ||
+         open_error == ESTALE || open_error == EIO) &&
+        recover_to_existing_parent(listing_path)) {
+        safe_copy(listing_path, sizeof(listing_path), cwd_path);
+        count = build_directory_entries(listing_path, entries, MAX_ENTRIES,
+                                        "current-pane-recovered");
+        if (count >= 0)
+            set_message("drive unavailable; moved to parent directory");
+    }
+
+    if (count < 0) {
+        entry_count = 0;
+        loaded_dir_stat_valid = 0;
+        debug_log("load_dir rejected listing_path=\"%s\" "
+                  "reason=opendir-failed errno=%d",
+                  listing_path, open_error);
+        if (open_error == EAGAIN)
+            set_message("loading directory...");
+        else if (!message[0] || strcmp(message, "loading directory...") == 0)
+            set_message("cannot read directory");
+        return;
+    }
+
+    entry_count = count;
+    if (strcmp(message, "loading directory...") == 0)
+        set_message("");
+
+    loaded_dir_stat_valid = browsing_stat(listing_path, &loaded_dir_stat) == 0;
+    if (loaded_dir_stat_valid &&
+        directory_type_cache_apply(listing_path, &loaded_dir_stat,
+                                   entries, entry_count) > 0)
+        qsort(entries, (size_t)entry_count, sizeof(entries[0]), cmp_entries);
+
+    debug_log("entries final path=\"%s\" count=%d", listing_path, entry_count);
+    for (int i = 0; i < entry_count; i++)
+        debug_log("entry final index=%d name=\"%s\" is_dir=%d source=%s",
+                  i, entries[i].name, entries[i].is_dir,
+                  entry_is_unmounted_drive(&entries[i]) ?
+                      "drive-snapshot" : "filesystem");
+
+    if (cursor >= entry_count) cursor = entry_count - 1;
+    if (cursor < 0) cursor = 0;
+    if (top < 0) top = 0;
+
+    (void)start_directory_type_worker(listing_path);
+}
+
+static int loaded_directory_changed(const char *path) {
+    struct stat current;
+
+    if (!loaded_dir_stat_valid || !path || browsing_stat(path, &current) != 0)
+        return 1;
+
+    if (current.st_dev != loaded_dir_stat.st_dev ||
+        current.st_ino != loaded_dir_stat.st_ino ||
+        current.st_size != loaded_dir_stat.st_size)
+        return 1;
+
+#ifdef __APPLE__
+    return current.st_mtimespec.tv_sec != loaded_dir_stat.st_mtimespec.tv_sec ||
+           current.st_mtimespec.tv_nsec != loaded_dir_stat.st_mtimespec.tv_nsec ||
+           current.st_ctimespec.tv_sec != loaded_dir_stat.st_ctimespec.tv_sec ||
+           current.st_ctimespec.tv_nsec != loaded_dir_stat.st_ctimespec.tv_nsec;
+#else
+    return current.st_mtim.tv_sec != loaded_dir_stat.st_mtim.tv_sec ||
+           current.st_mtim.tv_nsec != loaded_dir_stat.st_mtim.tv_nsec ||
+           current.st_ctim.tv_sec != loaded_dir_stat.st_ctim.tv_sec ||
+           current.st_ctim.tv_nsec != loaded_dir_stat.st_ctim.tv_nsec;
+#endif
+}
+
+static void refresh_loaded_directory(void) {
+    char focused_name[NAME_MAX + 1] = "";
+    int old_screen_row = cursor - top;
+
+    if (cursor >= 0 && cursor < entry_count)
+        safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
+
+    load_dir(cwd_path);
+    if (focused_name[0])
+        set_cursor_to_name(focused_name);
+
+    /* Keep the focused file on the same screen row, including when files
+     * were added or removed ahead of it. */
+    if (old_screen_row < 0)
+        old_screen_row = 0;
+    top = cursor - old_screen_row;
+    if (top < 0)
+        top = 0;
+}
+
+static int check_network_updates(void) {
+    int changed = network_poll();
+
+    if ((changed & NETWORK_DIRECTORY_CHANGED) && network_ui_path(cwd_path))
+        refresh_loaded_directory();
+    else
+        changed &= ~NETWORK_DIRECTORY_CHANGED;
+    return changed & (NETWORK_DIRECTORY_CHANGED | NETWORK_PARENT_CHANGED |
+                      NETWORK_DETAILS_CHANGED);
+}
+
+#ifdef __FreeBSD__
+static int freebsd_recover_if_unmounted_media_cwd(void) {
+    if (!freebsd_path_is_unmounted_media_tree(cwd_path))
+        return 0;
+    if (chdir("/media") != 0)
+        return 0;
+    safe_copy(cwd_path, sizeof(cwd_path), "/media");
+    cursor = 0;
+    top = 0;
+    load_dir(cwd_path);
+    set_message("drive unavailable; moved to media directory");
+    return 1;
+}
+#endif
+
+static void volume_monitor_changed(GVolumeMonitor *monitor,
+                                   gpointer object,
+                                   gpointer user_data) {
+    const char *signal_name = user_data ? (const char *)user_data : "unknown";
+    const char *object_type = object ? G_OBJECT_TYPE_NAME(object) : "none";
+    char *name = NULL;
+
+    (void)monitor;
+    if (object && G_IS_VOLUME(object))
+        name = g_volume_get_name(G_VOLUME(object));
+    else if (object && G_IS_MOUNT(object))
+        name = g_mount_get_name(G_MOUNT(object));
+
+    debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
+              signal_name, object_type, name ? name : "");
+    g_free(name);
+#ifdef __FreeBSD__
+    freebsd_clear_media_lookup_cache();
+#endif
+    drive_state_dirty = 1;
+}
+
+static void clear_mounting_volume_state(void) {
+#ifdef __linux__
+    g_clear_object(&mounting_cancellable);
+    mounting_device[0] = '\0';
+    mounting_recovery_attempted = 0;
+#endif
+    g_clear_object(&mounting_volume);
+    mounting_drive_id[0] = '\0';
+    mounting_drive_activity[0] = '\0';
+}
+
+static int mount_flags_are_writable(unsigned long flags) {
+    return (flags & ST_RDONLY) == 0;
+}
+
+#ifdef __linux__
+static int linux_start_mount_recovery(void);
+#endif
+
+static void rejected_mount_unmounted(GObject *source_object,
+                                     GAsyncResult *result,
+                                     gpointer user_data) {
+    GMount *mount = G_MOUNT(source_object);
+    const char *success_message = user_data;
+    GError *error = NULL;
+
+    if (g_mount_unmount_with_operation_finish(mount, result, &error)) {
+        set_message(success_message);
+    } else {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure),
+                 "mount blocked, but rollback unmount failed: %.190s",
+                 error ? error->message : "unknown error");
+        set_message(failure);
+    }
+    debug_log("rejected mount rollback result=%s detail=%s",
+              error ? "failed" : "unmounted",
+              error ? error->message : success_message);
+    g_clear_error(&error);
+    g_free(user_data);
+    clear_mounting_volume_state();
+    drive_state_dirty = 1;
+}
+
+static void rollback_rejected_mount(GMount *mount, const char *message) {
+    GMountOperation *operation;
+
+    if (!mount)
+        return;
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "unmounting...");
+    operation = g_mount_operation_new();
+    g_mount_unmount_with_operation(
+        mount, G_MOUNT_UNMOUNT_NONE, operation,
+#ifdef __linux__
+        mounting_cancellable,
+#else
+        NULL,
+#endif
+        rejected_mount_unmounted, g_strdup(message));
+    g_object_unref(operation);
+}
+
+static void volume_mount_finished(GObject *source_object,
+                                  GAsyncResult *result,
+                                  gpointer user_data) {
+    GVolume *volume = G_VOLUME(source_object);
+    GError *error = NULL;
+    GMount *mount = NULL;
+    GFile *root = NULL;
+    char *path = NULL;
+    int rollback_started = 0;
+
+    (void)user_data;
+
+    if (!g_volume_mount_finish(volume, result, &error) &&
+        !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_ALREADY_MOUNTED)) {
+#ifdef __linux__
+        if (linux_start_mount_recovery()) {
+            debug_log("direct mount failed; starting recovery device=%s "
+                      "detail=%s", mounting_device,
+                      error ? error->message : "unknown");
+            g_clear_error(&error);
+            return;
+        }
+#endif
+        char failure[256];
+        snprintf(failure, sizeof(failure), "mount failed: %s",
+                 error ? error->message : "unknown error");
+        set_message(failure);
+        goto out;
+    }
+
+    mount = g_volume_get_mount(volume);
+    if (!mount) {
+        set_message("mount failed: no mount was created");
+        goto out;
+    }
+
+    root = g_mount_get_default_location(mount);
+    path = root ? g_file_get_path(root) : NULL;
+    if (!path) {
+        rollback_rejected_mount(
+            mount,
+            "mount blocked: local path unavailable; left unmounted");
+        rollback_started = 1;
+        goto out;
+    }
+    {
+        struct statvfs filesystem;
+
+        if (statvfs(path, &filesystem) != 0) {
+            rollback_rejected_mount(
+                mount,
+                "mount blocked: read-write state could not be verified; "
+                "left unmounted");
+            rollback_started = 1;
+            goto out;
+        }
+        if (!mount_flags_are_writable(filesystem.f_flag)) {
+            rollback_rejected_mount(
+                mount,
+                "mount blocked: drive mounted read-only; left unmounted");
+            rollback_started = 1;
+            goto out;
+        }
+    }
+    if (!safe_copy(mounted_volume_path,
+                   sizeof(mounted_volume_path), path)) {
+        rollback_rejected_mount(
+            mount,
+            "mount blocked: local path is too long; left unmounted");
+        rollback_started = 1;
+        goto out;
+    }
+
+    set_message("drive mounted read-write");
+
+out:
+    g_free(path);
+    g_clear_object(&root);
+    g_clear_object(&mount);
+    g_clear_error(&error);
+    if (!rollback_started)
+        clear_mounting_volume_state();
+#ifdef __FreeBSD__
+    freebsd_clear_media_lookup_cache();
+#endif
+    drive_state_dirty = 1;
+}
+
+#ifdef __APPLE__
+__attribute__((unused))
+#endif
+static void begin_gio_volume_mount(void) {
+    GMountOperation *operation;
+
+    if (!mounting_volume)
+        return;
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    operation = g_mount_operation_new();
+    g_mount_operation_set_password_save(operation,
+                                        G_PASSWORD_SAVE_FOR_SESSION);
+    g_volume_mount(mounting_volume,
+                   G_MOUNT_MOUNT_NONE,
+                   operation,
+#ifdef __linux__
+                   mounting_cancellable,
+#else
+                   NULL,
+#endif
+                   volume_mount_finished,
+                   NULL);
+    g_object_unref(operation);
+}
+
+#ifdef __linux__
+static void linux_volume_preflight_progress(SimpleFilesUDisksStage stage,
+                                            gpointer user_data) {
+    const char *activity = "checking...";
+    const char *status = "mount failed; checking drive";
+
+    (void)user_data;
+    if (stage == SIMPLEFILES_UDISKS_REPAIRING) {
+        activity = "repairing...";
+        status = "drive is dirty; repairing before mount";
+    } else if (stage == SIMPLEFILES_UDISKS_VERIFYING) {
+        activity = "verifying...";
+        status = "verifying repaired drive before mount";
+    }
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              activity);
+    set_message(status);
+    debug_log("linux mount preflight stage=%d device=%s",
+              stage, mounting_device);
+}
+
+static void linux_volume_preflight_finished(
+    gboolean ready_to_mount, gboolean repaired, const char *error_detail,
+    gpointer user_data);
+
+static int linux_start_mount_recovery(void) {
+    if (mounting_recovery_attempted || !mounting_volume ||
+        !mounting_device[0] || !mounting_cancellable)
+        return 0;
+
+    mounting_recovery_attempted = 1;
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "checking...");
+    set_message("mount failed; checking drive before one retry");
+    if (simplefiles_udisks_preflight_start(
+            mounting_device, mounting_cancellable,
+            linux_volume_preflight_progress,
+            linux_volume_preflight_finished, NULL))
+        return 1;
+
+    set_message("mount failed: could not start filesystem check");
+    return 0;
+}
+
+static int linux_mounting_volume_matches_device(void) {
+    char resolved[PATH_MAX];
+    char *device;
+    const char *candidate;
+    int matches;
+
+    if (!mounting_volume || !mounting_device[0])
+        return 0;
+    device = g_volume_get_identifier(
+        mounting_volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+    if (!device)
+        return 0;
+    candidate = realpath(device, resolved) ? resolved : device;
+    matches = strcmp(candidate, mounting_device) == 0;
+    g_free(device);
+    return matches;
+}
+
+static void linux_volume_preflight_finished(
+    gboolean ready_to_mount, gboolean repaired, const char *error_detail,
+    gpointer user_data) {
+    GMount *unexpected_mount;
+
+    (void)user_data;
+    if (!mounting_volume)
+        return;
+    if (!ready_to_mount) {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure), "mount blocked: %.220s",
+                 error_detail && error_detail[0] ? error_detail :
+                 "filesystem check or repair failed");
+        debug_log("linux mount preflight failed device=%s detail=%s",
+                  mounting_device,
+                  error_detail ? error_detail : "unknown");
+        set_message(failure);
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+    if (!linux_mounting_volume_matches_device() ||
+        !g_volume_can_mount(mounting_volume)) {
+        set_message("mount blocked: drive changed during filesystem check");
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+
+    unexpected_mount = g_volume_get_mount(mounting_volume);
+    if (unexpected_mount) {
+        g_object_unref(unexpected_mount);
+        set_message("mount blocked: drive was mounted during check");
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+
+    set_message(repaired ? "drive repaired; retrying mount" :
+                           "drive is clean; retrying mount");
+    debug_log("linux mount preflight passed device=%s repaired=%d",
+              mounting_device, repaired);
+    begin_gio_volume_mount();
+}
+#endif
+
+static void mount_volume_entry(Entry *entry) {
+    DriveRecord *record = entry_drive_record(entry);
+    char status[256];
+#ifdef __linux__
+    char resolved_device[PATH_MAX];
+#endif
+
+#ifdef __APPLE__
+    if (!record || !record->device[0])
+        return;
+    if (!file_operation_can_start())
+        return;
+    if (!record->can_mount) {
+        set_message("drive is no longer mountable");
+        drive_state_dirty = 1;
+        return;
+    }
+    snprintf(status, sizeof(status), "mounting %.240s...",
+             record->name[0] ? record->name : "drive");
+    set_message(status);
+    pid_t pid = fork();
+    if (pid == 0) {
+        redirect_background_stdio();
+        execl("/usr/sbin/diskutil", "diskutil", "mount", record->device,
+              (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid < 0) {
+        set_message("mount failed: could not start diskutil");
+        return;
+    }
+    remember_file_operation(pid, FILE_OPERATION_MOUNT, cwd_path, entry->name);
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              record->id);
+    safe_copy(file_operation_device, sizeof(file_operation_device),
+              record->device);
+    file_operation_path[0] = '\0';
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id), record->id);
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    return;
+#else
+    if (!record || !record->volume)
+        return;
+    if (mounting_volume) {
+        set_message("another drive is already mounting");
+        return;
+    }
+    if (!record->can_mount || !g_volume_can_mount(record->volume)) {
+        set_message("drive is no longer mountable");
+        drive_state_dirty = 1;
+        return;
+    }
+
+    snprintf(status, sizeof(status), "mounting %.240s...",
+             record->name[0] ? record->name : "drive");
+    set_message(status);
+
+    mounted_volume_path[0] = '\0';
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id), record->id);
+    mounting_volume = g_object_ref(record->volume);
+#ifdef __linux__
+    if (!realpath(record->device, resolved_device) ||
+        !simplefiles_udisks_device_allowed(resolved_device) ||
+        !safe_copy(mounting_device, sizeof(mounting_device),
+                   resolved_device)) {
+        set_message("mount blocked: exact drive identity unavailable");
+        clear_mounting_volume_state();
+        return;
+    }
+    mounting_cancellable = g_cancellable_new();
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    mounting_recovery_attempted = 0;
+    begin_gio_volume_mount();
+#else
+    begin_gio_volume_mount();
+#endif
+#endif
+}
+
+static void init_volume_monitor(void) {
+    static const char *signals[] = {
+        "volume-added", "volume-removed", "volume-changed",
+        "mount-added", "mount-removed", "mount-changed"
+    };
+
+    volume_monitor = g_volume_monitor_get();
+    if (!volume_monitor) {
+        debug_log("volume monitor init result=unavailable");
+        return;
+    }
+
+    debug_log("volume monitor init result=ready type=%s",
+              G_OBJECT_TYPE_NAME(volume_monitor));
+
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+        g_signal_connect(volume_monitor, signals[i],
+                         G_CALLBACK(volume_monitor_changed),
+                         (gpointer)signals[i]);
+    refresh_drive_snapshot();
+}
+
+static int process_volume_monitor_events(void) {
+    char focused_name[NAME_MAX + 1] = "";
+    char focused_drive_id[PATH_MAX] = "";
+    char departed_mount_path[PATH_MAX] = "";
+    int snapshot_changed;
+    int recovered_from_removed_drive = 0;
+    int redraw = 0;
+
+    while (g_main_context_pending(NULL))
+        g_main_context_iteration(NULL, FALSE);
+
+    snapshot_changed = drive_state_dirty;
+    if (snapshot_changed) {
+        DriveRecord *containing = mounted_drive_containing_path(cwd_path);
+
+        if (containing)
+            safe_copy(departed_mount_path, sizeof(departed_mount_path),
+                      containing->mount_path);
+        if (cursor >= 0 && cursor < entry_count) {
+            DriveRecord *focused = entry_drive_record(&entries[cursor]);
+            safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
+            if (focused)
+                safe_copy(focused_drive_id, sizeof(focused_drive_id),
+                          focused->id);
+        }
+        refresh_drive_snapshot();
+        if (departed_mount_path[0] && !mounted_volume_path[0] &&
+            !mounted_drive_containing_path(cwd_path) &&
+            recover_to_existing_parent(departed_mount_path)) {
+            cursor = 0;
+            top = 0;
+            recovered_from_removed_drive = 1;
+            set_message("drive removed; moved to media directory");
+        }
+    }
+
+    if (mounted_volume_path[0]) {
+        char path[PATH_MAX];
+        safe_copy(path, sizeof(path), mounted_volume_path);
+        mounted_volume_path[0] = '\0';
+
+        remember_current_cursor();
+        if (chdir(path) == 0) {
+            if (!getcwd(cwd_path, sizeof(cwd_path)))
+                safe_copy(cwd_path, sizeof(cwd_path), path);
+            cursor = 0;
+            top = 0;
+            load_dir(cwd_path);
+        } else {
+            char failure[256];
+            snprintf(failure, sizeof(failure), "mounted drive unavailable: %s",
+                     strerror(errno));
+            set_message(failure);
+        }
+        redraw = 1;
+    } else if (snapshot_changed) {
+        load_dir(cwd_path);
+        if (!recovered_from_removed_drive && focused_drive_id[0]) {
+            for (int i = 0; i < entry_count; i++) {
+                DriveRecord *record = entry_drive_record(&entries[i]);
+                if (record && strcmp(record->id, focused_drive_id) == 0) {
+                    cursor = i;
+                    break;
+                }
+            }
+        } else if (!recovered_from_removed_drive && focused_name[0]) {
+            set_cursor_to_name(focused_name);
+        }
+        redraw = 1;
+    }
+
+    return redraw;
+}
+
+static void close_volume_monitor(void) {
+    entry_count = 0;
+#ifdef __linux__
+    if (mounting_cancellable)
+        g_cancellable_cancel(mounting_cancellable);
+#endif
+    clear_mounting_volume_state();
+    clear_drive_snapshot();
+    g_clear_object(&volume_monitor);
+}
+
+static int is_selected(const char *path) {
+    for (int i = 0; i < selected_count; i++) {
+        if (strcmp(selected[i], path) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void toggle_selected(const char *path) {
+    for (int i = 0; i < selected_count; i++) {
+        if (strcmp(selected[i], path) == 0) {
+            if (i < selected_count - 1)
+                memmove(&selected[i], &selected[i + 1],
+                        (size_t)(selected_count - i - 1) * sizeof(*selected));
+            selected_count--;
+            return;
+        }
+    }
+
+    if (selected_count < MAX_SELECTED && ensure_selected_capacity(selected_count + 1)) {
+        strncpy(selected[selected_count], path, PATH_MAX - 1);
+        selected[selected_count][PATH_MAX - 1] = '\0';
+        selected_count++;
+    }
+}
+
+static void clear_selected(void) {
+    selected_count = 0;
+}
+
+static void select_all_toggle(void) {
+    int selectable_count = 0;
+
+    if (entry_count <= 0)
+        return;
+
+    for (int i = 0; i < entry_count; i++) {
+        if (!entry_is_unmounted_drive(&entries[i]))
+            selectable_count++;
+    }
+
+    if (selected_count == selectable_count) {
+        clear_selected();
+        return;
+    }
+
+    clear_selected();
+
+    for (int i = 0; i < entry_count && selected_count < MAX_SELECTED; i++) {
+        if (entry_is_unmounted_drive(&entries[i]))
+            continue;
+        char full[PATH_MAX];
+        join_path(full, cwd_path, entries[i].name);
+        if (!ensure_selected_capacity(selected_count + 1))
+            break;
+        safe_copy(selected[selected_count], sizeof(selected[selected_count]), full);
+        selected_count++;
+    }
+}
+
+static void invert_selection(void) {
+    for (int i = 0; i < entry_count; i++) {
+        if (entry_is_unmounted_drive(&entries[i]))
+            continue;
+        char full[PATH_MAX];
+        join_path(full, cwd_path, entries[i].name);
+        toggle_selected(full);
+    }
+}
+
+static void clear_clipboard(void) {
+    clipboard_count = 0;
+    clipboard_mode = 0;
+    clipboard_generation++;
+}
+
+static void add_clipboard_path(const char *path) {
+    if (clipboard_count >= MAX_CLIPBOARD) return;
+    if (!ensure_clipboard_capacity(clipboard_count + 1)) return;
+
+    safe_copy(clipboard_paths[clipboard_count], sizeof(clipboard_paths[clipboard_count]), path);
+    clipboard_count++;
+}
+
+static void yank_or_cut(int mode) {
+    clear_clipboard();
+
+    clipboard_mode = mode;
+
+    if (selected_count > 0) {
+        for (int i = 0; i < selected_count && i < MAX_CLIPBOARD; i++)
+            add_clipboard_path(selected[i]);
+    } else if (entry_count > 0) {
+        char full[PATH_MAX];
+        join_path(full, cwd_path, entries[cursor].name);
+        add_clipboard_path(full);
+    }
+
+    clear_selected();
+
+    if (clipboard_count == 0) {
+        clipboard_mode = 0;
+        set_message("clipboard empty");
+    } else if (clipboard_mode == 'y') {
+        set_message("copied to clipboard");
+    } else if (clipboard_mode == 'd') {
+        set_message("cut to clipboard");
+    }
+}
+
+static uint64_t recursive_size(const char *path) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0)
+        return 0;
+
+    if (S_ISREG(st.st_mode))
+        return (uint64_t)st.st_size;
+
+    if (S_ISDIR(st.st_mode)) {
+        uint64_t total = 0;
+        DIR *dir = opendir(path);
+        if (!dir)
+            return 0;
+
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char full[PATH_MAX];
+            join_path(full, path, de->d_name);
+            total += recursive_size(full);
+        }
+
+        closedir(dir);
+        return total;
+    }
+
+    return 0;
+}
+
+static int ensure_paste_progress(void) {
+    if (paste_progress)
+        return 1;
+
+    paste_progress = mmap(NULL, sizeof(*paste_progress),
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (paste_progress == MAP_FAILED) {
+        paste_progress = NULL;
+        return 0;
+    }
+
+    memset((void *)paste_progress, 0, sizeof(*paste_progress));
+    return 1;
+}
+
+static void paste_progress_add_bytes(size_t bytes) {
+    if (paste_progress && paste_progress->active)
+        paste_progress->done_bytes += (uint64_t)bytes;
+}
+
+static int copy_file_buffered(int in, int out) {
+    unsigned char *buf = malloc(COPY_BUFFER_SIZE);
+    ssize_t n;
+
+    if (!buf)
+        return -1;
+
+    while ((n = read(in, buf, COPY_BUFFER_SIZE)) != 0) {
+        size_t offset = 0;
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            free(buf);
+            return -1;
+        }
+
+        while (offset < (size_t)n) {
+            ssize_t written = write(out, buf + offset, (size_t)n - offset);
+
+            if (written < 0) {
+                if (errno == EINTR)
+                    continue;
+                free(buf);
+                return -1;
+            }
+            if (written == 0) {
+                errno = EIO;
+                free(buf);
+                return -1;
+            }
+
+            offset += (size_t)written;
+            paste_progress_add_bytes((size_t)written);
+        }
+    }
+
+    free(buf);
+    return 0;
+}
+
+#if defined(__linux__) || defined(__FreeBSD__)
+static int copy_file_range_fallback_error(int error) {
+    return error == ENOSYS || error == EOPNOTSUPP || error == EXDEV ||
+           error == EINVAL;
+}
+
+static int copy_file_kernel(int in, int out, off_t size) {
+    off_t copied = 0;
+
+    while (copied < size) {
+        off_t remaining = size - copied;
+        size_t request = remaining > (off_t)COPY_FILE_RANGE_CHUNK
+                           ? COPY_FILE_RANGE_CHUNK : (size_t)remaining;
+        ssize_t count = copy_file_range(in, NULL, out, NULL, request, 0);
+
+        if (count > 0) {
+            copied += count;
+            paste_progress_add_bytes((size_t)count);
+            continue;
+        }
+        if (count == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        if (copy_file_range_fallback_error(errno))
+            return 0;
+        return -1;
+    }
+
+    return 1;
+}
+#endif
+
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    int in = open(src, O_RDONLY);
+    int out;
+    int result = -1;
+    int failure_error = 0;
+    struct stat st;
+
+    if (in < 0)
+        return -1;
+
+    out = open(dst, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+
+#ifndef __APPLE__
+    (void)posix_fadvise(in, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+
+#if defined(__linux__) || defined(__FreeBSD__)
+    if (fstat(in, &st) == 0 && S_ISREG(st.st_mode)) {
+        int kernel_result = copy_file_kernel(in, out, st.st_size);
+
+        if (kernel_result > 0)
+            result = 0;
+        else if (kernel_result < 0)
+            result = -1;
+        else
+            result = copy_file_buffered(in, out);
+    } else {
+        result = copy_file_buffered(in, out);
+    }
+#else
+    (void)st;
+    result = copy_file_buffered(in, out);
+#endif
+
+    if (result != 0)
+        failure_error = errno ? errno : EIO;
+    if (close(in) != 0 && result == 0) {
+        failure_error = errno;
+        result = -1;
+    }
+    if (close(out) != 0 && result == 0) {
+        failure_error = errno;
+        result = -1;
+    }
+    if (result != 0) {
+        unlink(dst);
+        errno = failure_error ? failure_error : EIO;
+    }
+    return result;
+}
+
+/* Applications such as PDF readers often turn one open into thousands of
+ * small random reads.  That is cheap on a local disk and painfully latent on
+ * an NFS mount.  Files opened from SimpleServe are therefore copied once,
+ * sequentially, into a versioned local cache before the desktop application
+ * sees them. */
+static uint64_t open_cache_path_hash(const char *path) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    if (!path)
+        return hash;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        hash ^= (uint64_t)*p;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int path_is_simpleserve_file(const char *path) {
+    const char *home = getenv("HOME");
+    char root[PATH_MAX];
+    size_t root_len;
+
+    if (!path || !home || !home[0] || path[0] != '/')
+        return 0;
+    if (snprintf(root, sizeof(root), "%s/SimpleServe", home) >=
+        (int)sizeof(root))
+        return 0;
+    root_len = strlen(root);
+    return strncmp(path, root, root_len) == 0 && path[root_len] == '/';
+}
+
+static void open_cache_safe_name(char *out, size_t outsz, const char *path) {
+    const char *name = base_name(path);
+    size_t used = 0;
+
+    if (!out || outsz == 0)
+        return;
+    if (!name || !name[0])
+        name = "file";
+    for (const unsigned char *p = (const unsigned char *)name;
+         *p && used + 1 < outsz; p++) {
+        unsigned char ch = *p;
+        out[used++] = (ch < 32 || ch == 127 || ch == '/') ? '_' : (char)ch;
+    }
+    out[used] = '\0';
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    uint64_t size;
+    time_t used;
+} OpenCacheEntry;
+
+/* Keep the cache bounded.  Cache-file mtimes are deliberately used as the
+ * last-used clock; a cache hit touches the file, so this remains reliable even
+ * on filesystems mounted with noatime. */
+static void open_cache_touch(const char *path) {
+    struct timespec times[2];
+
+    if (!path || !path[0])
+        return;
+    times[0].tv_sec = time(NULL);
+    times[0].tv_nsec = 0;
+    times[1] = times[0];
+    utimensat(AT_FDCWD, path, times, 0);
+}
+
+static void open_cache_prune(const char *cache_dir, const char *keep_path) {
+    DIR *dir;
+    struct dirent *de;
+    OpenCacheEntry *items = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    uint64_t total = 0;
+
+    if (!cache_dir || !cache_dir[0])
+        return;
+    dir = opendir(cache_dir);
+    if (!dir)
+        return;
+
+    while ((de = readdir(dir)) != NULL) {
+        char path[PATH_MAX];
+        struct stat st;
+        OpenCacheEntry *grown;
+
+        if (de->d_name[0] == '.' || strstr(de->d_name, ".part-") != NULL)
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s", cache_dir, de->d_name) >=
+            (int)sizeof(path) || lstat(path, &st) != 0 ||
+            !S_ISREG(st.st_mode))
+            continue;
+        if ((uintmax_t)st.st_size > UINT64_MAX - total)
+            total = UINT64_MAX;
+        else
+            total += (uint64_t)st.st_size;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 32;
+            grown = realloc(items, next * sizeof(*items));
+            if (!grown)
+                break;
+            items = grown;
+            capacity = next;
+        }
+        safe_copy(items[count].path, sizeof(items[count].path), path);
+        items[count].size = (uint64_t)st.st_size;
+        items[count].used = st.st_mtime;
+        count++;
+    }
+    closedir(dir);
+
+    while (total > config_open_cache_max_bytes) {
+        ssize_t oldest = -1;
+
+        for (size_t i = 0; i < count; i++) {
+            if (!items[i].path[0] ||
+                (keep_path && strcmp(items[i].path, keep_path) == 0))
+                continue;
+            if (oldest < 0 || items[i].used < items[oldest].used)
+                oldest = (ssize_t)i;
+        }
+        if (oldest < 0)
+            break;
+        if (unlink(items[oldest].path) == 0) {
+            debug_log("network open cache evict path=%s bytes=%ju",
+                      items[oldest].path, (uintmax_t)items[oldest].size);
+            total = items[oldest].size > total ? 0 : total - items[oldest].size;
+        }
+        items[oldest].path[0] = '\0';
+    }
+    free(items);
+}
+
+/* Return path unchanged for local files, small files, a disabled cache, or
+ * when caching fails. */
+static void prepare_open_path(char *out, size_t outsz, const char *path) {
+    struct stat source_st;
+    struct stat cache_st;
+    const char *home = getenv("HOME");
+    char cache_dir[PATH_MAX];
+    char cache_name[NAME_MAX + 1];
+    char final_path[PATH_MAX];
+    char temp_path[PATH_MAX];
+    uint64_t hash;
+
+    safe_copy(out, outsz, path);
+    if (!path_is_simpleserve_file(path) || !home ||
+        stat(path, &source_st) != 0 || !S_ISREG(source_st.st_mode) ||
+        config_open_cache_max_bytes == 0 || source_st.st_size < 0 ||
+        (uint64_t)source_st.st_size < config_open_cache_min_bytes)
+        return;
+
+    if (snprintf(cache_dir, sizeof(cache_dir),
+                 "%s/.cache/simplefiles/open", home) >= (int)sizeof(cache_dir) ||
+        mkdir_p(cache_dir) != 0)
+        return;
+
+    hash = open_cache_path_hash(path);
+    open_cache_safe_name(cache_name, sizeof(cache_name), path);
+    if (snprintf(final_path, sizeof(final_path),
+                 "%s/%016jx-%ju-%jd-%s", cache_dir,
+                 (uintmax_t)hash, (uintmax_t)source_st.st_size,
+                 (intmax_t)source_st.st_mtime, cache_name) >=
+        (int)sizeof(final_path))
+        return;
+
+    if (stat(final_path, &cache_st) == 0 && S_ISREG(cache_st.st_mode) &&
+        cache_st.st_size == source_st.st_size) {
+        open_cache_touch(final_path);
+        open_cache_prune(cache_dir, final_path);
+        safe_copy(out, outsz, final_path);
+        return;
+    }
+
+    if (snprintf(temp_path, sizeof(temp_path), "%s.part-%ld", final_path,
+                 (long)getpid()) >= (int)sizeof(temp_path))
+        return;
+    unlink(temp_path);
+
+    debug_log("network open cache copy source=%s destination=%s bytes=%jd",
+              path, final_path, (intmax_t)source_st.st_size);
+    if (copy_file(path, temp_path, 0600) != 0) {
+        debug_log("network open cache copy failed source=%s errno=%d", path,
+                  errno);
+        unlink(temp_path);
+        return;
+    }
+    if (rename(temp_path, final_path) != 0) {
+        if (errno != EEXIST) {
+            debug_log("network open cache rename failed destination=%s errno=%d",
+                      final_path, errno);
+            unlink(temp_path);
+            return;
+        }
+        unlink(temp_path);
+    }
+
+    if (stat(final_path, &cache_st) == 0 && S_ISREG(cache_st.st_mode) &&
+        cache_st.st_size == source_st.st_size) {
+        open_cache_touch(final_path);
+        open_cache_prune(cache_dir, final_path);
+        safe_copy(out, outsz, final_path);
+    }
+}
+
+static int copy_recursive(const char *src, const char *dst) {
+    struct stat st;
+
+    if (lstat(src, &st) != 0)
+        return -1;
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(dst, st.st_mode & 0777) != 0)
+            return -1;
+
+        DIR *dir = opendir(src);
+        if (!dir)
+            return -1;
+
+        struct dirent *de;
+
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char sfull[PATH_MAX];
+            char dfull[PATH_MAX];
+
+            join_path(sfull, src, de->d_name);
+            join_path(dfull, dst, de->d_name);
+
+            if (copy_recursive(sfull, dfull) != 0) {
+                int failure_error = errno ? errno : EIO;
+
+                closedir(dir);
+                errno = failure_error;
+                return -1;
+            }
+        }
+
+        if (closedir(dir) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (S_ISREG(st.st_mode))
+        return copy_file(src, dst, st.st_mode & 0777);
+
+    errno = ENOTSUP;
+    return -1;
+}
+
+static int remove_recursive(const char *path) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0)
+        return -1;
+#ifdef __linux__
+    trash_progress();
+#endif
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir(path);
+        if (!dir)
+            return -1;
+
+        struct dirent *de;
+
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char full[PATH_MAX];
+            join_path(full, path, de->d_name);
+
+            if (remove_recursive(full) != 0) {
+                closedir(dir);
+                return -1;
+            }
+        }
+
+        closedir(dir);
+        return rmdir(path);
+    }
+
+    return unlink(path);
+}
+
+__attribute__((unused)) static int unique_trash_path(char *dst, const char *trash, const char *name) {
+    char candidate[PATH_MAX];
+    join_path(candidate, trash, name);
+
+    if (!path_exists(candidate)) {
+        safe_copy(dst, PATH_MAX, candidate);
+        return 0;
+    }
+
+    time_t now = time(NULL);
+
+    for (int i = 1; i < 10000; i++) {
+        {
+            char numbered[NAME_MAX + 64];
+            if (snprintf(numbered, sizeof(numbered), "%s.%ld.%d", name, (long)now, i) >= (int)sizeof(numbered))
+                continue;
+            if (!safe_join3(candidate, sizeof(candidate), trash, "/", numbered))
+                continue;
+        }
+
+        if (!path_exists(candidate)) {
+            safe_copy(dst, PATH_MAX, candidate);
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+/* GIO refuses to trash a directory unless its contents are writable, even
+ * when the directory's parent is writable and a same-filesystem rename is
+ * sufficient.  This matters for root-owned backup trees on removable ext4
+ * filesystems.  Fall back to the freedesktop per-filesystem trash layout. */
+#ifndef __APPLE__
+static int filesystem_root_for_path(const char *path, char *out) {
+    char current[PATH_MAX];
+    struct stat current_st;
+
+    safe_copy(current, sizeof(current), path);
+    char *slash = strrchr(current, '/');
+    if (!slash)
+        return -1;
+    if (slash == current)
+        current[1] = '\0';
+    else
+        *slash = '\0';
+    if (stat(current, &current_st) != 0)
+        return -1;
+
+    for (;;) {
+        char parent[PATH_MAX];
+        struct stat parent_st;
+
+        safe_copy(parent, sizeof(parent), current);
+        slash = strrchr(parent, '/');
+        if (!slash || slash == parent) {
+            safe_copy(parent, sizeof(parent), "/");
+        } else {
+            *slash = '\0';
+        }
+        if (strcmp(parent, current) == 0 || stat(parent, &parent_st) != 0 ||
+            parent_st.st_dev != current_st.st_dev) {
+            safe_copy(out, PATH_MAX, current);
+            return 0;
+        }
+        safe_copy(current, sizeof(current), parent);
+        current_st = parent_st;
+    }
+}
+
+static int write_trash_info(const char *info_path, const char *src) {
+    FILE *fp = fopen(info_path, "wx");
+    time_t now;
+    struct tm local;
+
+    if (!fp)
+        return -1;
+    now = time(NULL);
+    localtime_r(&now, &local);
+    if (fprintf(fp, "[Trash Info]\nPath=") < 0) {
+        fclose(fp);
+        unlink(info_path);
+        return -1;
+    }
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || strchr("/-_.~", *p))
+            fputc(*p, fp);
+        else
+            fprintf(fp, "%%%02X", *p);
+    }
+    if (fprintf(fp, "\nDeletionDate=%04d-%02d-%02dT%02d:%02d:%02d\n",
+                local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                local.tm_hour, local.tm_min, local.tm_sec) < 0 ||
+        fclose(fp) != 0) {
+        unlink(info_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int move_to_filesystem_trash(const char *src) {
+    char root[PATH_MAX], trash[PATH_MAX], files[PATH_MAX], info[PATH_MAX];
+    char dst[PATH_MAX], info_path[PATH_MAX], info_name[NAME_MAX + 16];
+    const char *name = base_name(src);
+
+    if (!name || !*name || filesystem_root_for_path(src, root) != 0)
+        return -1;
+    if (snprintf(trash, sizeof(trash), "%s/.Trash-%lu", root,
+                 (unsigned long)getuid()) >= (int)sizeof(trash) ||
+        !safe_join3(files, sizeof(files), trash, "/", "files") ||
+        !safe_join3(info, sizeof(info), trash, "/", "info"))
+        return -1;
+    if ((mkdir(trash, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(files, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(info, 0700) != 0 && errno != EEXIST) ||
+        unique_trash_path(dst, files, name) != 0)
+        return -1;
+    name = base_name(dst);
+    if (snprintf(info_name, sizeof(info_name), "%s.trashinfo", name) >=
+        (int)sizeof(info_name) ||
+        !safe_join3(info_path, sizeof(info_path), info, "/", info_name) ||
+        write_trash_info(info_path, src) != 0)
+        return -1;
+    if (rename(src, dst) == 0)
+        return 0;
+    unlink(info_path);
+    return -1;
+}
+#endif
+
+static int ensure_delete_progress(void) {
+    if (delete_progress)
+        return 1;
+
+    delete_progress = mmap(NULL, sizeof(*delete_progress),
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (delete_progress == MAP_FAILED) {
+        delete_progress = NULL;
+        return 0;
+    }
+
+    memset((void *)delete_progress, 0, sizeof(*delete_progress));
+    return 1;
+}
+
+static int write_delete_result(int fd, const DeleteResult *result) {
+    const char *p = (const char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_delete_result(int fd, DeleteResult *result) {
+    char *p = (char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int move_to_trash_one(const char *src) {
+    if (config_trash_dir[0]) {
+        char trash[PATH_MAX];
+        char dst[PATH_MAX];
+        const char *name = base_name(src);
+
+        if (get_configured_trash_dir(trash) != 0 || !name || !*name)
+            return -1;
+        if (unique_trash_path(dst, trash, name) != 0)
+            return -1;
+        if (rename(src, dst) == 0)
+            return 0;
+        if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0)
+            return 0;
+        remove_recursive(dst);
+        return -1;
+    }
+
+#ifdef __APPLE__
+    return run_macos_files_helper("--trash", src) == 0 ? 0 : -1;
+#else
+    char cmd[PATH_MAX * 4 + 128];
+
+    snprintf(cmd, sizeof(cmd), "gio trash -- ");
+    shell_quote_append(cmd, sizeof(cmd), src);
+    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
+
+    if (system(cmd) == 0)
+        return 0;
+    return move_to_filesystem_trash(src);
+#endif
+}
+
+static void arm_delete(void) {
+    if (!config_confirm_delete) {
+        confirm_delete();
+        return;
+    }
+
+    if (selected_count > 0) {
+        pending_delete = 1;
+        set_message(config_trash_dir[0] ?
+                    "delete selected to configured trash? y/N" :
+                    "delete selected to trash? y/N");
+        return;
+    }
+
+    if (entry_count > 0) {
+        pending_delete = 1;
+        set_message(config_trash_dir[0] ?
+                    "delete current to configured trash? y/N" :
+                    "delete current to trash? y/N");
+        return;
+    }
+
+    set_message("nothing to delete");
+}
+
+static void confirm_delete(void) {
+    int item_count = selected_count > 0 ? selected_count : (entry_count > 0 ? 1 : 0);
+
+    if (item_count <= 0) {
+        set_message("nothing to delete");
+        return;
+    }
+    if (delete_worker_pid > 0) {
+        set_message("delete already in progress");
+        return;
+    }
+    if (file_operation_pid > 0) {
+        set_message("another file operation is in progress");
+        return;
+    }
+    if (paste_worker_pid > 0) {
+        set_message("another operation is in progress");
+        return;
+    }
+    if (!ensure_delete_progress()) {
+        set_message("delete failed: no progress memory");
+        return;
+    }
+
+    char (*paths)[PATH_MAX] = calloc((size_t)item_count, sizeof(*paths));
+    if (!paths) {
+        set_message("delete failed: out of memory");
+        return;
+    }
+
+    if (selected_count > 0) {
+        for (int i = 0; i < item_count; i++)
+            safe_copy(paths[i], PATH_MAX, selected[i]);
+    } else {
+        join_path(paths[0], cwd_path, entries[cursor].name);
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        free(paths);
+        set_message("delete failed: could not start worker");
+        return;
+    }
+
+    memset((void *)delete_progress, 0, sizeof(*delete_progress));
+    delete_progress->total_items = (uint64_t)item_count;
+    delete_progress->stage = 1;
+    delete_progress->active = 1;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        /*
+         * Absolute input paths are used below.  Do not inherit a removable
+         * filesystem as cwd: an otherwise idle details worker must never make
+         * that filesystem busy at unmount time.
+         */
+        if (chdir("/") != 0)
+            _exit(127);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        uint64_t *sizes = calloc((size_t)item_count, sizeof(*sizes));
+        DeleteResult result = {0, 0};
+
+        if (sizes) {
+            for (int i = 0; i < item_count; i++) {
+                sizes[i] = recursive_size(paths[i]);
+                delete_progress->total_bytes += sizes[i];
+            }
+        }
+
+        delete_progress->stage = 2;
+        for (int i = 0; i < item_count; i++) {
+            if (move_to_trash_one(paths[i]) == 0)
+                result.ok++;
+            else
+                result.fail++;
+
+            if (sizes)
+                delete_progress->done_bytes += sizes[i];
+            delete_progress->done_items++;
+        }
+
+        write_delete_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        free(sizes);
+        free(paths);
+        _exit(result.fail > 0 && result.ok == 0 ? 1 : 0);
+    }
+
+    close(result_pipe[1]);
+    free(paths);
+
+    if (pid < 0) {
+        close(result_pipe[0]);
+        delete_progress->active = 0;
+        set_message("delete failed: could not start worker");
+        return;
+    }
+
+    delete_worker_pid = pid;
+    delete_result_fd = result_pipe[0];
+    clear_selected();
+    set_message("moving to trash in background");
+    debug_log("delete worker started pid=%ld items=%d", (long)pid, item_count);
+}
+
+#ifndef __linux__
+static const char *select_delete_authorizer(int interactive_terminal,
+                                            int have_sudo,
+                                            int have_pkexec) {
+    if (interactive_terminal && have_sudo)
+        return "sudo";
+    if (have_pkexec)
+        return "pkexec";
+    if (have_sudo)
+        return "sudo";
+    return NULL;
+}
+#endif
+
+static void confirm_permanent_delete(void) {
+    int item_count = selected_count > 0 ? selected_count :
+                     (entry_count > 0 ? 1 : 0);
+    char **argv;
+    const char *authorizer;
+    pid_t pid;
+    int status = 0;
+
+    if (file_operation_pid > 0) {
+        set_message("wait for the background file operation to finish");
+        return;
+    }
+    if (item_count <= 0) {
+        set_message("nothing to delete");
+        return;
+    }
+#ifdef __linux__
+    authorizer = (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) ?
+                 "/usr/bin/pkexec" : "/usr/bin/sudo";
+#else
+    int interactive_terminal = isatty(STDIN_FILENO) ||
+                               isatty(STDOUT_FILENO) ||
+                               isatty(STDERR_FILENO);
+    authorizer = select_delete_authorizer(
+        interactive_terminal,
+        ssp_command_available("sudo"),
+        ssp_command_available("pkexec"));
+    if (!authorizer) {
+        set_message("permanent delete failed: install sudo or pkexec");
+        debug_log("permanent delete: no authorization helper available");
+        return;
+    }
+#endif
+    argv = calloc((size_t)item_count + 6, sizeof(*argv));
+    if (!argv) {
+        set_message("permanent delete failed: out of memory");
+        return;
+    }
+    argv[0] = (char *)authorizer;
+#ifdef __linux__
+    argv[1] = "/usr/bin/rm";
+#else
+    argv[1] = "/bin/rm";
+#endif
+    argv[2] = "-rf";
+#ifdef __linux__
+    argv[3] = "--one-file-system";
+#else
+    argv[3] = "-x";
+#endif
+    argv[4] = "--";
+    for (int i = 0; i < item_count; i++) {
+        argv[i + 5] = malloc(PATH_MAX);
+        if (!argv[i + 5]) {
+            for (int j = 0; j < i; j++) free(argv[j + 5]);
+            free(argv);
+            set_message("permanent delete failed: out of memory");
+            return;
+        }
+        if (selected_count > 0)
+            safe_copy(argv[i + 5], PATH_MAX, selected[i]);
+        else
+            join_path(argv[i + 5], cwd_path, entries[cursor].name);
+    }
+
+    def_prog_mode();
+    endwin();
+#ifndef __linux__
+    debug_log("permanent delete starting authorizer=%s items=%d terminal=%d",
+              authorizer, item_count, interactive_terminal);
+#endif
+    pid = fork();
+    if (pid == 0) {
+#ifdef __linux__
+        execv(argv[0], argv);
+#else
+        execvp(argv[0], argv);
+#endif
+        _exit(127);
+    }
+    if (pid < 0 || waitpid(pid, &status, 0) < 0)
+        status = -1;
+    reset_prog_mode();
+    refresh();
+    clearok(stdscr, TRUE);
+
+    for (int i = 0; i < item_count; i++) free(argv[i + 5]);
+    free(argv);
+    clear_selected();
+    load_dir(cwd_path);
+    if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        set_message("permanently deleted");
+    else if (strcmp(authorizer,
+#ifdef __linux__
+                    "/usr/bin/pkexec"
+#else
+                    "pkexec"
+#endif
+                   ) == 0 && status >= 0 &&
+             WIFEXITED(status) && WEXITSTATUS(status) == 126)
+        set_message("permanent delete canceled");
+    else {
+        set_message("permanent delete failed");
+#ifndef __linux__
+        debug_log("permanent delete failed authorizer=%s status=%d exit=%d",
+                  authorizer, status,
+                  status >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+#endif
+    }
+}
+
+static int check_background_delete(void) {
+    if (delete_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(delete_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    DeleteResult result;
+    int have_result = delete_result_fd >= 0 &&
+                      read_delete_result(delete_result_fd, &result);
+    if (delete_result_fd >= 0)
+        close(delete_result_fd);
+
+    debug_log("delete worker finished pid=%ld status=%d result=%d",
+              (long)delete_worker_pid, status, have_result);
+    delete_worker_pid = -1;
+    delete_result_fd = -1;
+    if (delete_progress)
+        delete_progress->active = 0;
+
+    cancel_info_worker();
+    load_dir(cwd_path);
+
+    if (!have_result) {
+        set_message("background delete failed");
+        return 1;
+    }
+
+    if (result.ok > 0 && result.fail == 0)
+        set_message(config_trash_dir[0] ?
+                    "moved to configured trash" :
+                    "moved to trash");
+    else if (result.ok > 0)
+        set_message(config_trash_dir[0] ?
+                    "some moved to configured trash; some failed" :
+                    "some moved to trash; some failed");
+    else
+        set_message(config_trash_dir[0] ?
+                    "configured trash move failed" :
+                    "trash move failed");
+
+    return 1;
+}
+
+static int path_is_same_or_child(const char *parent, const char *child) {
+    size_t n;
+
+    if (!parent || !child) return 0;
+    if (strcmp(parent, child) == 0) return 1;
+
+    n = strlen(parent);
+    if (n == 0) return 0;
+    if (strncmp(child, parent, n) != 0) return 0;
+    if (parent[n - 1] == '/') return 1;
+    return child[n] == '/';
+}
+
+static void paste_result_record_error(PasteResult *result, int error_number) {
+    if (result && result->first_error == 0)
+        result->first_error = error_number ? error_number : EIO;
+}
+
+static void perform_paste(const char *destination, PasteResult *result) {
+    memset(result, 0, sizeof(*result));
+
+    for (int i = 0; i < clipboard_count; i++) {
+        const char *src = clipboard_paths[i];
+        const char *name = base_name(src);
+
+        if (name[0] == '\0') {
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
+            continue;
+        }
+
+        char plain_dst[PATH_MAX];
+        char dst[PATH_MAX];
+        join_path(plain_dst, destination, name);
+        unique_paste_path(dst, destination, name);
+
+        if (strcmp(src, dst) == 0) {
+            result->fail++;
+            paste_result_record_error(result, EINVAL);
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
+            continue;
+        }
+        if (path_is_same_or_child(src, destination)) {
+            result->fail++;
+            paste_result_record_error(result, EINVAL);
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
+            continue;
+        }
+        if (strcmp(plain_dst, dst) != 0)
+            result->renamed++;
+
+        if (clipboard_mode == 'd') {
+            int operation_error = 0;
+            int moved = 0;
+
+            errno = 0;
+            if (rename(src, dst) == 0) {
+                moved = 1;
+            } else if (copy_recursive(src, dst) == 0) {
+                if (remove_recursive(src) == 0)
+                    moved = 1;
+                else
+                    operation_error = errno;
+            } else {
+                operation_error = errno;
+            }
+
+            if (moved) {
+                safe_copy(result->last_pasted_name,
+                          sizeof(result->last_pasted_name), base_name(dst));
+                result->ok++;
+            } else {
+                result->fail++;
+                paste_result_record_error(result, operation_error);
+            }
+        } else if (clipboard_mode == 'y') {
+            errno = 0;
+            if (copy_recursive(src, dst) == 0) {
+                safe_copy(result->last_pasted_name,
+                          sizeof(result->last_pasted_name), base_name(dst));
+                result->ok++;
+            } else {
+                result->fail++;
+                paste_result_record_error(result, errno);
+            }
+        } else {
+            result->fail++;
+            paste_result_record_error(result, EINVAL);
+        }
+        if (paste_progress && paste_progress->active)
+            paste_progress->done_items++;
+    }
+}
+
+static int write_pipe_result(int fd, const PasteResult *result) {
+    const char *p = (const char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_pipe_result(int fd, PasteResult *result) {
+    char *p = (char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int paste_clipboard(void) {
+    if (paste_worker_pid > 0) {
+        set_message("paste already in progress");
+        return -1;
+    }
+    if (delete_worker_pid > 0) {
+        set_message("another operation is in progress");
+        return -1;
+    }
+    if (file_operation_pid > 0) {
+        set_message("another operation is in progress");
+        return -1;
+    }
+    if (clipboard_count <= 0 || clipboard_mode == 0) {
+        set_message("nothing to paste");
+        return -1;
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        set_message("paste failed: could not start worker");
+        return -1;
+    }
+
+    safe_copy(paste_destination, sizeof(paste_destination), cwd_path);
+    paste_worker_mode = clipboard_mode;
+    paste_clipboard_generation = clipboard_generation;
+
+    if (!ensure_paste_progress()) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        set_message("paste failed: no progress memory");
+        return -1;
+    }
+    memset((void *)paste_progress, 0, sizeof(*paste_progress));
+    paste_progress->total_items = (uint64_t)clipboard_count;
+    paste_progress->active = 1;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        PasteResult result;
+        perform_paste(paste_destination, &result);
+        write_pipe_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        _exit(result.fail > 0 && result.ok == 0 ? 1 : 0);
+    }
+
+    close(result_pipe[1]);
+    if (pid < 0) {
+        close(result_pipe[0]);
+        paste_progress->active = 0;
+        set_message("paste failed: could not start worker");
+        return -1;
+    }
+
+    paste_worker_pid = pid;
+    paste_result_fd = result_pipe[0];
+    set_message("pasting in background");
+    debug_log("paste worker started pid=%ld destination=%s items=%d mode=%c",
+              (long)pid, paste_destination, clipboard_count, clipboard_mode);
+    return 0;
+}
+
+static int check_background_paste(void) {
+    if (paste_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(paste_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    PasteResult result;
+    int have_result = paste_result_fd >= 0 &&
+                      read_pipe_result(paste_result_fd, &result);
+    cancel_info_worker();
+    if (paste_result_fd >= 0)
+        close(paste_result_fd);
+
+    debug_log("paste worker finished pid=%ld status=%d result=%d",
+              (long)paste_worker_pid, status, have_result);
+    paste_worker_pid = -1;
+    paste_result_fd = -1;
+    if (paste_progress)
+        paste_progress->active = 0;
+
+    if (!have_result) {
+        set_message("background paste failed");
+        return 1;
+    }
+
+    load_dir(cwd_path);
+    if (strcmp(cwd_path, paste_destination) == 0 && result.last_pasted_name[0])
+        set_cursor_to_name(result.last_pasted_name);
+
+    if (paste_worker_mode == 'd' && result.ok > 0 &&
+        clipboard_generation == paste_clipboard_generation)
+        clear_clipboard();
+
+    if (result.ok > 0 && result.fail == 0 && result.renamed > 0)
+        set_message("paste complete; renamed duplicates");
+    else if (result.ok > 0 && result.fail == 0)
+        set_message("paste complete");
+    else if (result.ok > 0) {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure), "paste partly complete: %s",
+                 strerror(result.first_error ? result.first_error : EIO));
+        set_message(failure);
+    } else {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure), "paste failed: %s",
+                 strerror(result.first_error ? result.first_error : EIO));
+        set_message(failure);
+    }
+
+    return 1;
+}
+
+static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
+    wchar_t ws[8192];
+    int length;
+    int offset = 0;
+    size_t count = 0;
+    int columns = 0;
+
+    if (!win || w <= 0)
+        return;
+    if (!s)
+        s = "";
+
+    /* Clear the row in one ncurses operation instead of one waddch() call per
+     * column.  The current attributes are preserved, including reverse-video
+     * selection rows. */
+    mvwhline(win, y, x, ' ', w);
+
+    length = (int)strlen(s);
+
+    /* Decode only the text that can actually fit.  Truncate on display-column
+     * boundaries so wide Unicode characters are never split or allowed to
+     * spill into the next row. */
+    while (offset < length && count + 1 < sizeof(ws) / sizeof(ws[0])) {
+        wchar_t wc;
+        int width = 1;
+        int used = text_character_at(s, length, offset, &wc, &width);
+
+        if (used <= 0)
+            break;
+        if (columns + width > w)
+            break;
+
+        ws[count++] = wc;
+        columns += width;
+        offset += used;
+    }
+    ws[count] = L'\0';
+
+    if (count > 0) {
+        wmove(win, y, x);
+        waddnwstr(win, ws, (int)count);
+    }
+}
+
+static void reset_command(void) {
+    command_mode = 0;
+    command[0] = '\0';
+    command_len = 0;
+    command_cursor = 0;
+    command_view_start = 0;
+    command_entry_path[0] = '\0';
+}
+
+static void clamp_command_cursor(void) {
+    if (command_len < 0)
+        command_len = 0;
+    if (command_len > (int)sizeof(command) - 1)
+        command_len = (int)sizeof(command) - 1;
+    if (command_cursor < 0)
+        command_cursor = 0;
+    if (command_cursor > command_len)
+        command_cursor = command_len;
+    command_cursor = text_boundary_at_or_before(
+        command, command_len, command_cursor);
+    command_view_start = text_boundary_at_or_before(
+        command, command_len, command_view_start);
+}
+
+static void adjust_command_view(int editable_cols) {
+    int max_cursor_column;
+
+    clamp_command_cursor();
+    if (command_view_start > command_cursor)
+        command_view_start = command_cursor;
+
+    if (editable_cols <= 0) {
+        command_view_start = command_cursor;
+        return;
+    }
+
+    max_cursor_column = editable_cols - 1;
+    while (command_view_start < command_cursor &&
+           text_columns_between(command, command_len, command_view_start,
+                                command_cursor) > max_cursor_column) {
+        command_view_start = text_next_offset(
+            command, command_len, command_view_start);
+    }
+
+    /* Reveal text before the cursor as it approaches the left edge.  Fill
+     * spare space too, so deleting text or widening the window brings the
+     * beginning back into view instead of leaving it hidden offscreen. */
+    while (command_view_start > 0) {
+        int previous = text_previous_offset(
+            command, command_len, command_view_start);
+
+        if (text_columns_between(command, command_len, previous,
+                                 command_cursor) > max_cursor_column / 2 &&
+            text_columns_between(command, command_len, previous,
+                                 command_len) > max_cursor_column)
+            break;
+        command_view_start = previous;
+    }
+}
+
+static void draw_command_status(WINDOW *win, int w) {
+    if (!win || w <= 0)
+        return;
+
+    int editable_cols = w > 1 ? w - 1 : 0;
+    adjust_command_view(editable_cols);
+
+    mvwaddch(win, 0, 0, ':');
+    if (editable_cols > 0)
+        draw_text(win, 0, 1, editable_cols,
+                  command + command_view_start);
+
+    leaveok(win, FALSE);
+    (void)curs_set(1);
+
+    int cursor_col = 0;
+    if (w > 1)
+        cursor_col = 1 + text_columns_between(
+            command, command_len, command_view_start, command_cursor);
+    if (cursor_col < 0)
+        cursor_col = 0;
+    if (cursor_col >= w)
+        cursor_col = w - 1;
+    wmove(win, 0, cursor_col);
+}
+
+static void clear_window(WINDOW *win) {
+    if (!win) return;
+    werase(win);
+}
+
+static void write_terminal_control(const char *sequence, size_t length) {
+    while (length > 0) {
+        ssize_t written = write(STDOUT_FILENO, sequence, length);
+        if (written > 0) {
+            sequence += written;
+            length -= (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+}
+
+static int screen_updates_can_synchronize(void) {
+    const char *term = getenv("TERM");
+    return isatty(STDOUT_FILENO) && term &&
+           term[0] != '\0' && strcmp(term, "dumb") != 0;
+}
+
+/* Modern terminals recognize DEC mode 2026 as a synchronized-update fence.
+ * Unknown private modes are safely ignored by older terminals. */
+static void begin_screen_update(void) {
+    static const char sync_begin[] = "\033[?2026h";
+
+    if (screen_updates_can_synchronize())
+        write_terminal_control(sync_begin, sizeof(sync_begin) - 1);
+}
+
+static void end_screen_update(void) {
+    static const char sync_end[] = "\033[?2026l";
+
+    fflush(stdout);
+    if (screen_updates_can_synchronize())
+        write_terminal_control(sync_end, sizeof(sync_end) - 1);
+}
+
+static int terminal_parse_da1(const char *response, size_t length,
+                              int *reports_sixel) {
+    if (reports_sixel)
+        *reports_sixel = 0;
+
+    for (size_t i = 0; i + 3 < length; i++) {
+        if (response[i] != '\033' || response[i + 1] != '[' ||
+            response[i + 2] != '?')
+            continue;
+
+        size_t position = i + 3;
+        int sixel = 0;
+        while (position < length) {
+            unsigned int value = 0;
+            int have_digit = 0;
+
+            if (response[position] == 'c') {
+                if (reports_sixel)
+                    *reports_sixel = sixel;
+                return 1;
+            }
+
+            while (position < length &&
+                   response[position] >= '0' && response[position] <= '9') {
+                have_digit = 1;
+                value = value * 10U +
+                        (unsigned int)(response[position] - '0');
+                position++;
+            }
+            if (have_digit && value == 4)
+                sixel = 1;
+            if (position < length && response[position] == ';')
+                position++;
+            else if (position < length && response[position] == 'c')
+                continue;
+            else
+                break;
+        }
+    }
+
+    return 0;
+}
+
+static int terminal_kitty_query_succeeded(const char *response,
+                                          size_t length) {
+    char marker[64];
+    int marker_length = snprintf(marker, sizeof(marker),
+                                 "\033_Gi=%u;OK\033\\",
+                                 IMAGE_PREVIEW_KITTY_ID);
+
+    return marker_length > 0 && marker_length < (int)sizeof(marker) &&
+           memmem(response, length, marker, (size_t)marker_length) != NULL;
+}
+
+static void terminal_query_graphics(int *kitty, int *sixel) {
+    char query[256];
+    char response[1024];
+    size_t length = 0;
+    struct pollfd descriptor = {
+        .fd = STDIN_FILENO,
+        .events = POLLIN
+    };
+    int query_length;
+    int da_complete = 0;
+
+    if (kitty) *kitty = 0;
+    if (sixel) *sixel = 0;
+    if (!terminal_is_available())
+        return;
+
+    query_length = snprintf(
+        query, sizeof(query),
+        "\033_Gi=%u,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033[c",
+        IMAGE_PREVIEW_KITTY_ID);
+    if (query_length <= 0 || query_length >= (int)sizeof(query))
+        return;
+
+    write_terminal_control(query, (size_t)query_length);
+    while (length < sizeof(response)) {
+        int ready = poll(&descriptor, 1, 40);
+        if (ready <= 0 || !(descriptor.revents & POLLIN))
+            break;
+
+        ssize_t count = read(STDIN_FILENO, response + length,
+                             sizeof(response) - length);
+        if (count > 0) {
+            length += (size_t)count;
+            da_complete = terminal_parse_da1(response, length, sixel);
+            if (da_complete)
+                break;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if (kitty)
+        *kitty = terminal_kitty_query_succeeded(response, length);
+    if (!da_complete && sixel)
+        *sixel = 0;
+}
+
+static TerminalGraphicsProtocol detect_terminal_graphics(void) {
+    const char *override = getenv("SIMPLEFILES_GRAPHICS");
+    const char *program = getenv("TERM_PROGRAM");
+    const char *lc_terminal = getenv("LC_TERMINAL");
+    int kitty = 0;
+    int sixel = 0;
+
+    if (override && override[0] && strcasecmp(override, "auto") != 0) {
+        if (strcasecmp(override, "kitty") == 0)
+            return TERMINAL_GRAPHICS_KITTY;
+        if (strcasecmp(override, "sixel") == 0)
+            return TERMINAL_GRAPHICS_SIXEL;
+        if (strcasecmp(override, "iterm") == 0 ||
+            strcasecmp(override, "iterm2") == 0)
+            return TERMINAL_GRAPHICS_ITERM;
+        return TERMINAL_GRAPHICS_NONE;
+    }
+
+    /* Passthrough policy differs between multiplexers.  Prefer metadata to
+     * leaking graphics control strings into a tmux/screen session. */
+    if (getenv("TMUX") || getenv("STY"))
+        return TERMINAL_GRAPHICS_NONE;
+
+    if ((program && (strcasecmp(program, "iTerm.app") == 0 ||
+                     strcasecmp(program, "iTerm2") == 0)) ||
+        (lc_terminal && strcasecmp(lc_terminal, "iTerm2") == 0))
+        return TERMINAL_GRAPHICS_ITERM;
+
+    terminal_query_graphics(&kitty, &sixel);
+    if (kitty)
+        return TERMINAL_GRAPHICS_KITTY;
+    if (sixel)
+        return TERMINAL_GRAPHICS_SIXEL;
+
+    return TERMINAL_GRAPHICS_NONE;
+}
+
+static const char *terminal_graphics_name(TerminalGraphicsProtocol protocol) {
+    switch (protocol) {
+        case TERMINAL_GRAPHICS_KITTY: return "kitty";
+        case TERMINAL_GRAPHICS_SIXEL: return "sixel";
+        case TERMINAL_GRAPHICS_ITERM: return "iterm2";
+        default: return "none";
+    }
+}
+
+static size_t image_base64_encode(const unsigned char *source, size_t length,
+                                  char *encoded) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t input = 0;
+    size_t output = 0;
+
+    while (input + 3 <= length) {
+        unsigned int value = ((unsigned int)source[input] << 16) |
+                             ((unsigned int)source[input + 1] << 8) |
+                             source[input + 2];
+        encoded[output++] = alphabet[(value >> 18) & 63U];
+        encoded[output++] = alphabet[(value >> 12) & 63U];
+        encoded[output++] = alphabet[(value >> 6) & 63U];
+        encoded[output++] = alphabet[value & 63U];
+        input += 3;
+    }
+
+    if (input < length) {
+        unsigned int value = (unsigned int)source[input] << 16;
+        encoded[output++] = alphabet[(value >> 18) & 63U];
+        if (input + 1 < length) {
+            value |= (unsigned int)source[input + 1] << 8;
+            encoded[output++] = alphabet[(value >> 12) & 63U];
+            encoded[output++] = alphabet[(value >> 6) & 63U];
+            encoded[output++] = '=';
+        } else {
+            encoded[output++] = alphabet[(value >> 12) & 63U];
+            encoded[output++] = '=';
+            encoded[output++] = '=';
+        }
+    }
+
+    return output;
+}
+
+static void terminal_move_to_preview(int row, int column) {
+    char position[64];
+    int length = snprintf(position, sizeof(position), "\0337\033[%d;%dH",
+                          row + 1, column + 1);
+    if (length > 0 && length < (int)sizeof(position))
+        write_terminal_control(position, (size_t)length);
+}
+
+static int render_kitty_image(int row, int column, int columns, int rows) {
+    const size_t chunk_size = 3072;
+    char encoded[4096];
+    size_t offset = 0;
+    int first = 1;
+
+    if (image_ready_format != IMAGE_DATA_PNG || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    while (offset < image_ready_bytes) {
+        char header[256];
+        size_t count = image_ready_bytes - offset;
+        if (count > chunk_size)
+            count = chunk_size;
+        int more = offset + count < image_ready_bytes;
+        size_t encoded_size = image_base64_encode(
+            image_ready_pixels + offset, count, encoded);
+        int header_size;
+
+        if (first) {
+            header_size = snprintf(
+                header, sizeof(header),
+                "\033_Ga=T,f=100,i=%u,p=1,c=%d,r=%d,C=1,q=2,m=%d;",
+                IMAGE_PREVIEW_KITTY_ID, columns, rows, more);
+            first = 0;
+        } else {
+            header_size = snprintf(header, sizeof(header),
+                                   "\033_Gm=%d;", more);
+        }
+        if (header_size <= 0 || header_size >= (int)sizeof(header))
+            return 0;
+
+        write_terminal_control(header, (size_t)header_size);
+        write_terminal_control(encoded, encoded_size);
+        write_terminal_control("\033\\", 2);
+        offset += count;
+    }
+    write_terminal_control("\0338", 2);
+    return 1;
+}
+
+static int render_iterm_image(int row, int column, int columns, int rows) {
+    char header[256];
+    char encoded[4096];
+    const size_t chunk_size = 3072;
+    size_t offset = 0;
+    int header_size;
+
+    if (image_ready_format != IMAGE_DATA_PNG || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    header_size = snprintf(
+        header, sizeof(header),
+        "\033]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1:",
+        columns, rows);
+    if (header_size <= 0 || header_size >= (int)sizeof(header))
+        return 0;
+    write_terminal_control(header, (size_t)header_size);
+
+    while (offset < image_ready_bytes) {
+        size_t count = image_ready_bytes - offset;
+        if (count > chunk_size)
+            count = chunk_size;
+        size_t encoded_size = image_base64_encode(
+            image_ready_pixels + offset, count, encoded);
+        write_terminal_control(encoded, encoded_size);
+        offset += count;
+    }
+
+    write_terminal_control("\a\0338", 3);
+    return 1;
+}
+
+static void sixel_append_run(GString *output, unsigned char value,
+                             int count) {
+    char sixel = (char)(63 + value);
+
+    if (count >= 4) {
+        g_string_append_printf(output, "!%d%c", count, sixel);
+    } else {
+        while (count-- > 0)
+            g_string_append_c(output, sixel);
+    }
+}
+
+static GString *build_sixel_frame(const unsigned char *pixels,
+                                  int width, int height) {
+    const int palette_size = IMAGE_PREVIEW_SIXEL_PALETTE_SIZE;
+    unsigned char *masks;
+    int last[IMAGE_PREVIEW_SIXEL_PALETTE_SIZE];
+    GString *output;
+
+    if (!pixels || width <= 0 || height <= 0 ||
+        (size_t)width > SIZE_MAX / (size_t)palette_size)
+        return NULL;
+
+    masks = calloc((size_t)palette_size * (size_t)width, 1);
+    if (!masks)
+        return NULL;
+
+    output = g_string_sized_new((size_t)width * (size_t)height / 2 + 4096);
+    if (!output) {
+        free(masks);
+        return NULL;
+    }
+
+    g_string_append_printf(output, "\033P0;1;0q\"1;1;%d;%d", width, height);
+    for (int color = 0; color < palette_size; color++) {
+        int red = color / 16;
+        int green = (color / 4) % 4;
+        int blue = color % 4;
+        g_string_append_printf(output, "#%d;2;%d;%d;%d", color,
+                               red * 100 / 3, green * 100 / 3,
+                               blue * 100 / 3);
+    }
+
+    for (int band = 0; band < height; band += 6) {
+        int emitted_color = 0;
+
+        memset(masks, 0, (size_t)palette_size * (size_t)width);
+        for (int color = 0; color < palette_size; color++)
+            last[color] = -1;
+
+        for (int y = 0; y < 6 && band + y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                const unsigned char *pixel = pixels +
+                    ((size_t)(band + y) * (size_t)width + (size_t)x) *
+                        IMAGE_PREVIEW_CHANNELS;
+                if (pixel[3] < 8)
+                    continue;
+
+                int red = ((int)pixel[0] * 3 + 127) / 255;
+                int green = ((int)pixel[1] * 3 + 127) / 255;
+                int blue = ((int)pixel[2] * 3 + 127) / 255;
+                int color = red * 16 + green * 4 + blue;
+                masks[(size_t)color * (size_t)width + (size_t)x] |=
+                    (unsigned char)(1U << y);
+                if (x > last[color])
+                    last[color] = x;
+            }
+        }
+
+        for (int color = 0; color < palette_size; color++) {
+            if (last[color] < 0)
+                continue;
+
+            if (emitted_color)
+                g_string_append_c(output, '$');
+            g_string_append_printf(output, "#%d", color);
+            emitted_color = 1;
+
+            unsigned char previous = 0;
+            int run = 0;
+            for (int x = 0; x <= last[color]; x++) {
+                unsigned char value =
+                    masks[(size_t)color * (size_t)width + (size_t)x];
+                if (run > 0 && value != previous) {
+                    sixel_append_run(output, previous, run);
+                    run = 0;
+                }
+                previous = value;
+                run++;
+            }
+            if (run > 0)
+                sixel_append_run(output, previous, run);
+        }
+
+        if (band + 6 < height)
+            g_string_append_c(output, '-');
+    }
+
+    g_string_append(output, "\033\\");
+    free(masks);
+    return output;
+}
+
+static int render_sixel_image(int row, int column) {
+    GString *sixel;
+
+    if (image_ready_format != IMAGE_DATA_RGBA || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    sixel = build_sixel_frame(image_ready_pixels, image_ready_width,
+                              image_ready_height);
+    if (!sixel)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    write_terminal_control("\033[?1070h", 8);
+    write_terminal_control(sixel->str, sixel->len);
+    write_terminal_control("\0338", 2);
+    g_string_free(sixel, TRUE);
+    return 1;
+}
+
+static void abandon_image_overlay(void) {
+    image_overlay_requested = 0;
+    image_overlay_requested_generation = 0;
+    image_overlay_active_generation = 0;
+}
+
+static void clear_active_image_overlay(void) {
+    if (image_overlay_active_generation == 0)
+        return;
+
+    if (terminal_graphics_protocol == TERMINAL_GRAPHICS_KITTY) {
+        char command[128];
+        int length = snprintf(command, sizeof(command),
+                              "\033_Ga=d,d=I,i=%u,q=2;\033\\",
+                              IMAGE_PREVIEW_KITTY_ID);
+        if (length > 0 && length < (int)sizeof(command))
+            write_terminal_control(command, (size_t)length);
+    } else if (curscr) {
+        /* SIXEL and iTerm images are part of the terminal's rendered cells.
+         * Force a full repaint because ncurses does not know those pixels
+         * exist and would otherwise optimize away the blanking writes. */
+        clearok(curscr, TRUE);
+    }
+
+    image_overlay_active_generation = 0;
+}
+
+static void dismiss_image_overlay(void) {
+    int repaint_cells = image_overlay_active_generation != 0 &&
+        terminal_graphics_protocol != TERMINAL_GRAPHICS_KITTY;
+
+    clear_active_image_overlay();
+    if (repaint_cells)
+        doupdate();
+    abandon_image_overlay();
+}
+
+static int image_overlay_matches_request(void) {
+    return image_overlay_requested &&
+           image_overlay_active_generation ==
+               image_overlay_requested_generation;
+}
+
+static void prepare_image_overlay_update(void) {
+    if (image_overlay_active_generation != 0 &&
+        !image_overlay_matches_request())
+        clear_active_image_overlay();
+}
+
+static void render_requested_image_overlay(void) {
+    int row, column;
+    int rendered = 0;
+
+    if (!image_overlay_requested || image_overlay_matches_request() ||
+        !preview_win || image_ready_generation !=
+                            image_overlay_requested_generation)
+        return;
+
+    getbegyx(preview_win, row, column);
+    switch (terminal_graphics_protocol) {
+        case TERMINAL_GRAPHICS_KITTY:
+            rendered = render_kitty_image(
+                row, column, image_overlay_requested_columns,
+                image_overlay_requested_rows);
+            break;
+        case TERMINAL_GRAPHICS_SIXEL:
+            rendered = render_sixel_image(row, column);
+            break;
+        case TERMINAL_GRAPHICS_ITERM:
+            rendered = render_iterm_image(
+                row, column, image_overlay_requested_columns,
+                image_overlay_requested_rows);
+            break;
+        default:
+            break;
+    }
+
+    if (rendered)
+        image_overlay_active_generation =
+            image_overlay_requested_generation;
+}
+
+static void present_screen(void) {
+    int overlay_repaint_needed =
+        image_overlay_active_generation != 0 &&
+        !image_overlay_matches_request();
+
+    begin_screen_update();
+    prepare_image_overlay_update();
+
+    /* wnoutrefresh() has already compared each window with newscr.  If it
+     * found no changed cells, asking ncurses to scan the physical screen is
+     * pure overhead.  Overlay removal is the exception: clear_active_image_
+     * overlay() may mark curscr for a forced repaint without touching newscr. */
+    /* A command-line edit can move only the hardware cursor without changing
+     * any cells.  In that case newscr is untouched, but doupdate() is still
+     * required to send the new cursor position to the terminal. */
+    if (command_mode || overlay_repaint_needed ||
+        (newscr != NULL && is_wintouched(newscr)))
+        doupdate();
+
+    render_requested_image_overlay();
+    end_screen_update();
+}
+
+static void draw_parent_pane(WINDOW *win, int w, int h) {
+    clear_window(win);
+    if (strcmp(cwd_path, "/") == 0) {
+        draw_text(win, 0, 0, w, "[root]");
+        return;
+    }
+
+    char parent[PATH_MAX];
+    safe_copy(parent, sizeof(parent), cwd_path);
+
+    char *slash = strrchr(parent, '/');
+    char current_name[NAME_MAX + 1] = "";
+
+    if (slash && slash != parent) {
+        safe_copy(current_name, sizeof(current_name), slash + 1);
+        *slash = '\0';
+    } else {
+        strcpy(parent, "/");
+        if (slash && slash == parent) {
+            safe_copy(current_name, sizeof(current_name), cwd_path + 1);
+        }
+    }
+
+#ifdef __FreeBSD__
+    if (strcmp(parent, "/media") == 0) {
+        char display_cwd[PATH_MAX];
+        char *display_slash;
+
+        if (freebsd_display_media_path(display_cwd, sizeof(display_cwd),
+                                       cwd_path) &&
+            (display_slash = strrchr(display_cwd, '/')) != NULL &&
+            display_slash[1] != '\0')
+            safe_copy(current_name, sizeof(current_name), display_slash + 1);
+    }
+#endif
+
+    Entry parent_entries[MAX_ENTRIES];
+    int count = build_directory_entries(parent, parent_entries, MAX_ENTRIES,
+                                        "parent-pane");
+    if (count < 0)
+        return;
+
+    debug_log("parent pane entries cwd=\"%s\" parent=\"%s\" current=\"%s\" count=%d",
+              cwd_path, parent, current_name, count);
+    for (int i = 0; i < count; i++)
+        debug_log("parent pane entry index=%d name=\"%s\" is_dir=%d",
+                  i, parent_entries[i].name, parent_entries[i].is_dir);
+
+    int maxrows = h;
+
+    for (int i = 0; i < count && i < maxrows; i++) {
+        char line[PATH_MAX];
+        safe_join3(line, sizeof(line),
+                   parent_entries[i].is_dir == 1 ? "/" : " ",
+                   "", parent_entries[i].name);
+
+        if (strcmp(parent_entries[i].name, current_name) == 0)
+            wattron(win, A_REVERSE);
+
+        draw_text(win, i, 0, w, line);
+
+        if (strcmp(parent_entries[i].name, current_name) == 0)
+            wattroff(win, A_REVERSE);
+    }
+}
+
+static void adjust_current_view(int view_h) {
+    if (cursor < top) top = cursor;
+    if (cursor >= top + view_h) top = cursor - view_h + 1;
+    if (top < 0) top = 0;
+}
+
+/* Resolve an ambiguous DT_UNKNOWN/DT_LNK row on demand and cache the result. */
+static int entry_resolve_is_dir(Entry *entry, const char *dir_path) {
+    char full[PATH_MAX];
+    struct stat st;
+
+    if (!entry)
+        return 0;
+    if (entry->is_dir >= 0)
+        return entry->is_dir == 1;
+    if (entry_is_unmounted_drive(entry)) {
+        entry->is_dir = 1;
+        return 1;
+    }
+    join_path(full, dir_path, entry->name);
+    int status = browsing_stat(full, &st);
+    if (status != 0 && errno == EAGAIN) {
+        set_message("checking item...");
+        return 0;
+    }
+    entry->is_dir = status == 0 && S_ISDIR(st.st_mode) ? 1 : 0;
+    return entry->is_dir == 1;
+}
+
+static int current_entry_is_dir(void) {
+    if (cursor < 0 || cursor >= entry_count)
+        return 0;
+    return entry_resolve_is_dir(&entries[cursor], cwd_path);
+}
+
+static int directory_stats_match(const struct stat *left,
+                                 const struct stat *right) {
+    if (!left || !right || left->st_dev != right->st_dev ||
+        left->st_ino != right->st_ino || left->st_size != right->st_size)
+        return 0;
+#ifdef __APPLE__
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static int directory_type_cache_apply(const char *path,
+                                      const struct stat *directory_stat,
+                                      Entry *target, int count) {
+    DirectoryTypeCacheEntry *cached = NULL;
+    int applied = 0;
+
+    if (!path || !*path || !directory_stat || !target || count <= 0)
+        return 0;
+    for (int i = 0; i < DIRECTORY_TYPE_CACHE_SIZE; i++) {
+        DirectoryTypeCacheEntry *candidate = &directory_type_cache[i];
+
+        if (candidate->items && strcmp(candidate->path, path) == 0 &&
+            directory_stats_match(&candidate->directory_stat,
+                                  directory_stat)) {
+            cached = candidate;
+            break;
+        }
+    }
+    if (!cached)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (entry_is_unmounted_drive(&target[i]) || target[i].is_dir >= 0)
+            continue;
+        for (int j = 0; j < cached->count; j++) {
+            if (strcmp(target[i].name, cached->items[j].name) != 0)
+                continue;
+            target[i].is_dir = cached->items[j].is_dir;
+            applied++;
+            break;
+        }
+    }
+    cached->last_used = ++directory_type_cache_clock;
+    return applied;
+}
+
+static void directory_type_cache_store(const char *path,
+                                       const struct stat *directory_stat) {
+    DirectoryTypeCacheEntry *slot = NULL;
+    DirectoryTypeCacheItem *items;
+    int count = 0;
+
+    if (!path || !*path || !directory_stat || entry_count <= 0)
+        return;
+    items = calloc((size_t)entry_count, sizeof(*items));
+    if (!items)
+        return;
+
+    for (int i = 0; i < entry_count; i++) {
+        if (entry_is_unmounted_drive(&entries[i]) || entries[i].is_dir < 0)
+            continue;
+        safe_copy(items[count].name, sizeof(items[count].name),
+                  entries[i].name);
+        items[count].is_dir = entries[i].is_dir;
+        count++;
+    }
+    if (count == 0) {
+        free(items);
+        return;
+    }
+
+    for (int i = 0; i < DIRECTORY_TYPE_CACHE_SIZE; i++) {
+        DirectoryTypeCacheEntry *entry = &directory_type_cache[i];
+
+        if (entry->items && strcmp(entry->path, path) == 0) {
+            slot = entry;
+            break;
+        }
+        if (!entry->items) {
+            if (!slot)
+                slot = entry;
+            continue;
+        }
+        if (!slot || (slot->items && entry->last_used < slot->last_used))
+            slot = entry;
+    }
+    if (!slot) {
+        free(items);
+        return;
+    }
+
+    free(slot->items);
+    memset(slot, 0, sizeof(*slot));
+    safe_copy(slot->path, sizeof(slot->path), path);
+    slot->directory_stat = *directory_stat;
+    slot->items = items;
+    slot->count = count;
+    slot->last_used = ++directory_type_cache_clock;
+}
+
+static void clear_directory_type_cache(void) {
+    for (int i = 0; i < DIRECTORY_TYPE_CACHE_SIZE; i++) {
+        free(directory_type_cache[i].items);
+        memset(&directory_type_cache[i], 0,
+               sizeof(directory_type_cache[i]));
+    }
+    directory_type_cache_clock = 0;
+}
+
+static void cancel_directory_type_worker(void) {
+    if (directory_type_worker_pid > 0)
+        cancel_worker_without_waiting(directory_type_worker_pid);
+    if (directory_type_result_fd >= 0)
+        close(directory_type_result_fd);
+
+    directory_type_worker_pid = -1;
+    directory_type_result_fd = -1;
+    directory_type_worker_path[0] = '\0';
+    directory_type_worker_generation = 0;
+}
+
+static int start_directory_type_worker(const char *path) {
+    int output_fd;
+    int unknown_count = 0;
+    pid_t pid;
+
+    if (!path || !*path)
+        return 0;
+    for (int i = 0; i < entry_count; i++) {
+        if (!entry_is_unmounted_drive(&entries[i]) &&
+            entries[i].is_dir < 0)
+            unknown_count++;
+    }
+    if (unknown_count == 0)
+        return 0;
+
+    cancel_directory_type_worker();
+    output_fd = image_temporary_fd();
+    if (output_fd < 0)
+        return 0;
+
+    pid = fork();
+    if (pid == 0) {
+        DIR *dir;
+        int directory_fd;
+
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (info_result_fd >= 0)
+            close(info_result_fd);
+        if (image_result_fd >= 0)
+            close(image_result_fd);
+        if (directory_preview_result_fd >= 0)
+            close(directory_preview_result_fd);
+        if (paste_result_fd >= 0)
+            close(paste_result_fd);
+        if (delete_result_fd >= 0)
+            close(delete_result_fd);
+        if (capacity_result_fd >= 0)
+            close(capacity_result_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        redirect_background_stdio();
+
+        dir = opendir(path);
+        if (!dir)
+            _exit(1);
+        directory_fd = dirfd(dir);
+
+        for (int i = 0; i < entry_count; i++) {
+            DirectoryTypeResult result;
+            struct stat st;
+            const char *bytes;
+            size_t left;
+            int resolved = 0;
+
+            if (entry_is_unmounted_drive(&entries[i]) ||
+                entries[i].is_dir >= 0)
+                continue;
+#ifdef __linux__
+            {
+                struct statx stx;
+
+                /* NFS readdir-plus commonly leaves the inode attributes in
+                 * cache even when d_type is DT_UNKNOWN.  Consume that cached
+                 * mode without asking the server to revalidate hundreds of
+                 * entries; fall back below only when no type was available. */
+                if (statx(directory_fd, entries[i].name,
+                          AT_STATX_DONT_SYNC, STATX_TYPE, &stx) == 0 &&
+                    (stx.stx_mask & STATX_TYPE) != 0) {
+                    result.is_dir =
+                        (stx.stx_mode & S_IFMT) == S_IFDIR ? 1 : 0;
+                    resolved = 1;
+                }
+            }
+#endif
+            if (!resolved &&
+                fstatat(directory_fd, entries[i].name, &st, 0) == 0) {
+                result.is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+                resolved = 1;
+            }
+            if (!resolved)
+                continue;
+
+            result.index = i;
+            bytes = (const char *)&result;
+            left = sizeof(result);
+            while (left > 0) {
+                ssize_t written = write(output_fd, bytes, left);
+
+                if (written > 0) {
+                    bytes += written;
+                    left -= (size_t)written;
+                } else if (written < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    closedir(dir);
+                    _exit(1);
+                }
+            }
+        }
+        closedir(dir);
+        _exit(0);
+    }
+
+    if (pid < 0) {
+        close(output_fd);
+        return 0;
+    }
+
+    directory_type_worker_pid = pid;
+    directory_type_result_fd = output_fd;
+    safe_copy(directory_type_worker_path,
+              sizeof(directory_type_worker_path), path);
+    directory_type_worker_generation = directory_listing_generation;
+    debug_log("directory type scan start path=\"%s\" unknown=%d pid=%ld",
+              path, unknown_count, (long)pid);
+    return 1;
+}
+
+static int check_background_directory_types(void) {
+    DirectoryTypeResult results[MAX_ENTRIES];
+    unsigned long completed_generation;
+    char completed_path[PATH_MAX];
+    char focused_name[NAME_MAX + 1] = "";
+    size_t bytes = 0;
+    int old_screen_row = cursor - top;
+    int status = 0;
+    int changed = 0;
+    pid_t pid;
+
+    if (directory_type_worker_pid <= 0)
+        return 0;
+    pid = waitpid(directory_type_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    safe_copy(completed_path, sizeof(completed_path),
+              directory_type_worker_path);
+    completed_generation = directory_type_worker_generation;
+
+    if (pid == directory_type_worker_pid && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0 && directory_type_result_fd >= 0 &&
+        lseek(directory_type_result_fd, 0, SEEK_SET) >= 0) {
+        while (bytes < sizeof(results)) {
+            ssize_t count = read(directory_type_result_fd,
+                                 (char *)results + bytes,
+                                 sizeof(results) - bytes);
+
+            if (count > 0)
+                bytes += (size_t)count;
+            else if (count < 0 && errno == EINTR)
+                continue;
+            else
+                break;
+        }
+    }
+
+    if (directory_type_result_fd >= 0)
+        close(directory_type_result_fd);
+    directory_type_result_fd = -1;
+    directory_type_worker_pid = -1;
+    directory_type_worker_path[0] = '\0';
+    directory_type_worker_generation = 0;
+
+    if (completed_generation != directory_listing_generation ||
+        strcmp(completed_path, cwd_path) != 0 ||
+        bytes % sizeof(results[0]) != 0)
+        return 0;
+
+    if (cursor >= 0 && cursor < entry_count)
+        safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
+
+    size_t result_count = bytes / sizeof(results[0]);
+    if (result_count == 0)
+        return 0;
+    for (size_t i = 0; i < result_count; i++) {
+        int idx = results[i].index;
+
+        if (idx < 0 || idx >= entry_count ||
+            entry_is_unmounted_drive(&entries[idx]) ||
+            entries[idx].is_dir == results[i].is_dir)
+            continue;
+        entries[idx].is_dir = results[i].is_dir;
+        changed++;
+    }
+
+    qsort(entries, (size_t)entry_count, sizeof(entries[0]), cmp_entries);
+    if (focused_name[0]) {
+        for (int i = 0; i < entry_count; i++) {
+            if (strcmp(entries[i].name, focused_name) == 0) {
+                cursor = i;
+                break;
+            }
+        }
+    }
+    if (old_screen_row < 0)
+        old_screen_row = 0;
+    top = cursor - old_screen_row;
+    if (top < 0)
+        top = 0;
+    if (loaded_dir_stat_valid)
+        directory_type_cache_store(completed_path, &loaded_dir_stat);
+
+    debug_log("directory type scan complete path=\"%s\" results=%zu "
+              "changed=%d", completed_path, result_count, changed);
+    return 1;
+}
+
+static void draw_current_row(WINDOW *win, int w, int row, int idx) {
+    if (idx >= entry_count) {
+        draw_text(win, row, 0, w, "");
+        return;
+    }
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[idx].name);
+
+    int sel = !entry_is_unmounted_drive(&entries[idx]) && is_selected(full);
+
+    char line[PATH_MAX];
+    snprintf(line, sizeof(line), "%c %s%s",
+             sel ? '*' : ' ',
+             entries[idx].is_dir == 1 ? "/" : " ",
+             entries[idx].name);
+
+    if (idx == cursor)
+        wattron(win, A_REVERSE);
+
+    draw_text(win, row, 0, w, line);
+
+    if (idx == cursor)
+        wattroff(win, A_REVERSE);
+}
+
+static void draw_current_pane(WINDOW *win, int w, int h) {
+    clear_window(win);
+    adjust_current_view(h);
+
+    for (int i = 0; i < h; i++)
+        draw_current_row(win, w, i, top + i);
+}
+
+static void cancel_directory_preview_worker(void) {
+    if (directory_preview_worker_pid > 0)
+        cancel_worker_without_waiting(directory_preview_worker_pid);
+    if (directory_preview_result_fd >= 0)
+        close(directory_preview_result_fd);
+
+    directory_preview_worker_pid = -1;
+    directory_preview_result_fd = -1;
+    directory_preview_worker_path[0] = '\0';
+    directory_preview_worker_rows = 0;
+}
+
+static DirectoryPreviewCacheEntry *directory_preview_cache_find(
+        const char *path, int rows) {
+    if (!path || !*path || rows <= 0)
+        return NULL;
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+
+        if (entry->result == DIRECTORY_PREVIEW_NONE || entry->rows != rows ||
+            strcmp(entry->path, path) != 0)
+            continue;
+
+        entry->last_used = ++directory_preview_cache_clock;
+        return entry;
+    }
+    return NULL;
+}
+
+static DirectoryPreviewCacheEntry *directory_preview_cache_peek(
+        const char *path, int rows) {
+    if (!path || !*path || rows <= 0)
+        return NULL;
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+        if (entry->result != DIRECTORY_PREVIEW_NONE && entry->rows == rows &&
+            strcmp(entry->path, path) == 0)
+            return entry;
+    }
+    return NULL;
+}
+
+static int directory_preview_cache_fresh(
+        const DirectoryPreviewCacheEntry *entry) {
+    struct timespec now;
+
+    if (!entry || entry->result == DIRECTORY_PREVIEW_NONE)
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 1;
+    return now.tv_sec - entry->ready_time.tv_sec <
+           (entry->result == DIRECTORY_PREVIEW_FAILED ?
+                DIRECTORY_PREVIEW_FAILURE_TTL_SEC :
+                DIRECTORY_PREVIEW_CACHE_TTL_SEC);
+}
+
+static int directory_preview_cached_type(const char *path, int *is_dir) {
+    DirectoryPreviewCacheEntry *best = NULL;
+    char resolved[PATH_MAX];
+
+    if (!path || !*path || !is_dir)
+        return 0;
+    resolve_media_directory(resolved, sizeof(resolved), path);
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+
+        if ((entry->result != DIRECTORY_PREVIEW_DIRECTORY &&
+             entry->result != DIRECTORY_PREVIEW_NOT_DIRECTORY) ||
+            strcmp(entry->path, resolved) != 0 ||
+            !directory_preview_cache_fresh(entry))
+            continue;
+        if (!best || entry->last_used > best->last_used)
+            best = entry;
+    }
+    if (!best)
+        return 0;
+
+    *is_dir = best->result == DIRECTORY_PREVIEW_DIRECTORY ? 1 : 0;
+    return 1;
+}
+
+/* Takes ownership of text.  The cache records both successful directory
+ * listings and negative probes, so DT_UNKNOWN files are not re-probed every
+ * time the cursor crosses them. */
+static void directory_preview_cache_store(const char *path, int rows,
+                                          int result, char *text) {
+    DirectoryPreviewCacheEntry *slot = NULL;
+
+    if (!path || !*path || rows <= 0 ||
+        result <= DIRECTORY_PREVIEW_NONE ||
+        result > DIRECTORY_PREVIEW_FAILED ||
+        (result == DIRECTORY_PREVIEW_DIRECTORY && !text)) {
+        free(text);
+        return;
+    }
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+
+        if (entry->result != DIRECTORY_PREVIEW_NONE && entry->rows == rows &&
+            strcmp(entry->path, path) == 0) {
+            slot = entry;
+            break;
+        }
+        if (entry->result == DIRECTORY_PREVIEW_NONE) {
+            if (!slot)
+                slot = entry;
+            continue;
+        }
+        if (!slot || (slot->result != DIRECTORY_PREVIEW_NONE &&
+                      entry->last_used < slot->last_used))
+            slot = entry;
+    }
+
+    if (!slot) {
+        free(text);
+        return;
+    }
+
+    free(slot->text);
+    memset(slot, 0, sizeof(*slot));
+    safe_copy(slot->path, sizeof(slot->path), path);
+    slot->rows = rows;
+    slot->text = text;
+    slot->result = result;
+    slot->last_used = ++directory_preview_cache_clock;
+    if (clock_gettime(CLOCK_MONOTONIC, &slot->ready_time) != 0)
+        memset(&slot->ready_time, 0, sizeof(slot->ready_time));
+}
+
+static void clear_directory_preview(void) {
+    cancel_directory_preview_worker();
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        free(directory_preview_cache[i].text);
+        memset(&directory_preview_cache[i], 0,
+               sizeof(directory_preview_cache[i]));
+    }
+    directory_preview_cache_clock = 0;
+}
+
+static int start_directory_preview_worker(const char *path, int rows) {
+    if (network_ui_path(path)) {
+        (void)network_read(path);
+        return 1;
+    }
+    int output_fd;
+    pid_t pid;
+
+    if (!path || !*path || rows <= 0)
+        return 0;
+    if (directory_preview_worker_pid > 0 &&
+        strcmp(directory_preview_worker_path, path) == 0 &&
+        directory_preview_worker_rows == rows)
+        return 1;
+
+    cancel_directory_preview_worker();
+    output_fd = image_temporary_fd();
+    if (output_fd < 0)
+        return 0;
+
+    pid = fork();
+    if (pid == 0) {
+        Entry pentries[MAX_ENTRIES];
+        int count;
+
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (info_result_fd >= 0)
+            close(info_result_fd);
+        if (image_result_fd >= 0)
+            close(image_result_fd);
+        if (paste_result_fd >= 0)
+            close(paste_result_fd);
+        if (delete_result_fd >= 0)
+            close(delete_result_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        count = build_directory_entries(path, pentries, MAX_ENTRIES,
+                                        "directory-preview-worker");
+        if (count < 0) {
+            int open_error = errno;
+            struct stat st;
+            int stat_ok = 0;
+
+            /* The probe replaces the old DT_UNKNOWN stat child.  opendir()
+             * proves a directory and supplies its preview in one trip.  On
+             * failure, stat only here in the child to distinguish a regular
+             * file from an unreadable directory without ever blocking the
+             * input thread. */
+            if (open_error == ENOTDIR)
+                _exit(2);
+            stat_ok = stat(path, &st) == 0;
+            if (stat_ok && !S_ISDIR(st.st_mode))
+                _exit(2);
+            if (stat_ok && S_ISDIR(st.st_mode)) {
+                if (dprintf(output_fd, "[cannot open directory]\n") < 0)
+                    _exit(1);
+                _exit(0);
+            }
+            _exit(1);
+        }
+
+        for (int i = 0; i < count && i < rows; i++) {
+            const char *prefix = pentries[i].is_dir == 1 ? "/" : " ";
+            if (dprintf(output_fd, "%s%s\n", prefix, pentries[i].name) < 0)
+                _exit(1);
+        }
+        /* The parent reads only after this child exits; fsync() would merely
+         * add storage latency to an IPC scratch file. */
+        _exit(0);
+    }
+
+    if (pid < 0) {
+        close(output_fd);
+        return 0;
+    }
+
+    directory_preview_worker_pid = pid;
+    directory_preview_result_fd = output_fd;
+    safe_copy(directory_preview_worker_path,
+              sizeof(directory_preview_worker_path), path);
+    directory_preview_worker_rows = rows;
+    return 1;
+}
+
+static int directory_preview_rows(void) {
+    int h, w;
+
+    if (!preview_win || single_pane_mode || !preview_pane_visible)
+        return 0;
+    getmaxyx(preview_win, h, w);
+    (void)w;
+    if (config_preview_lines < h)
+        h = config_preview_lines;
+    return h > 0 ? h : 0;
+}
+
+static int directory_preview_path_is_highlighted(const char *path, int rows) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (!path || !*path || info_mode || !config_preview ||
+        cursor < 0 || cursor >= entry_count || rows <= 0 ||
+        rows != directory_preview_rows())
+        return 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    return strcmp(resolved, path) == 0;
+}
+
+static int directory_preview_note_current_type(const char *path, int is_dir) {
+    if (!path || !*path)
+        return -1;
+
+    for (int i = 0; i < entry_count; i++) {
+        char full[PATH_MAX];
+        char resolved[PATH_MAX];
+
+        if (entry_is_unmounted_drive(&entries[i]))
+            continue;
+        join_path(full, cwd_path, entries[i].name);
+        resolve_media_directory(resolved, sizeof(resolved), full);
+        if (strcmp(resolved, path) != 0)
+            continue;
+        if (entries[i].is_dir == is_dir)
+            return -1;
+        entries[i].is_dir = is_dir;
+        return i;
+    }
+    return -1;
+}
+
+static int check_background_directory_preview(void) {
+    int status = 0;
+    pid_t pid;
+
+    directory_preview_changed_entry = -1;
+    if (directory_preview_worker_pid <= 0)
+        return 0;
+
+    pid = waitpid(directory_preview_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    char completed_path[PATH_MAX];
+    int completed_rows = directory_preview_worker_rows;
+    char *text = NULL;
+    int completed_ok = 0;
+    int completed_not_dir = 0;
+
+    safe_copy(completed_path, sizeof(completed_path),
+              directory_preview_worker_path);
+    if (pid == directory_preview_worker_pid && WIFEXITED(status)) {
+        completed_ok = WEXITSTATUS(status) == 0;
+        completed_not_dir = WEXITSTATUS(status) == 2;
+    }
+    if (completed_ok && directory_preview_result_fd >= 0) {
+        struct stat st;
+        if (fstat(directory_preview_result_fd, &st) == 0 &&
+            st.st_size >= 0 && st.st_size <= (off_t)(1024 * 1024)) {
+            size_t size = (size_t)st.st_size;
+            text = malloc(size + 1);
+            if (text && lseek(directory_preview_result_fd, 0, SEEK_SET) >= 0) {
+                size_t off = 0;
+                while (off < size) {
+                    ssize_t n = read(directory_preview_result_fd,
+                                     text + off, size - off);
+                    if (n > 0)
+                        off += (size_t)n;
+                    else if (n < 0 && errno == EINTR)
+                        continue;
+                    else
+                        break;
+                }
+                if (off == size)
+                    text[size] = '\0';
+                else {
+                    free(text);
+                    text = NULL;
+                }
+            } else {
+                free(text);
+                text = NULL;
+            }
+        }
+    }
+
+    if (directory_preview_result_fd >= 0)
+        close(directory_preview_result_fd);
+    directory_preview_result_fd = -1;
+    directory_preview_worker_pid = -1;
+    directory_preview_worker_path[0] = '\0';
+    directory_preview_worker_rows = 0;
+
+    if (text) {
+        directory_preview_cache_store(
+            completed_path, completed_rows,
+            DIRECTORY_PREVIEW_DIRECTORY, text);
+        directory_preview_changed_entry =
+            directory_preview_note_current_type(completed_path, 1);
+    } else if (completed_not_dir) {
+        directory_preview_cache_store(
+            completed_path, completed_rows,
+            DIRECTORY_PREVIEW_NOT_DIRECTORY, NULL);
+        directory_preview_changed_entry =
+            directory_preview_note_current_type(completed_path, 0);
+    } else if (!directory_preview_cache_peek(completed_path,
+                                             completed_rows)) {
+        /* A failed refresh must not replace a usable stale preview. */
+        directory_preview_cache_store(
+            completed_path, completed_rows,
+            DIRECTORY_PREVIEW_FAILED, NULL);
+    }
+
+    return directory_preview_path_is_highlighted(completed_path,
+                                                 completed_rows);
+}
+
+static int request_highlighted_directory_preview(void) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+    int rows = directory_preview_rows();
+
+    if (rows <= 0 || info_mode || !config_preview ||
+        cursor < 0 || cursor >= entry_count ||
+        entry_is_unmounted_drive(&entries[cursor]) ||
+        entries[cursor].is_dir == 0)
+        return 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+
+    /* A cached preview is already instant; do not create refresh traffic on
+     * the navigation path.  Stale entries are refreshed only during idle
+     * background prefetch below. */
+    if (directory_preview_cache_peek(resolved, rows))
+        return 0;
+
+    return start_directory_preview_worker(resolved, rows);
+}
+
+static int highlighted_directory_preview_is_cached(void) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+    DirectoryPreviewCacheEntry *cached;
+    int rows = directory_preview_rows();
+
+    if (rows <= 0 || info_mode || !config_preview ||
+        cursor < 0 || cursor >= entry_count ||
+        entry_is_unmounted_drive(&entries[cursor]) ||
+        entries[cursor].is_dir == 0)
+        return 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    cached = directory_preview_cache_peek(resolved, rows);
+    return cached &&
+           (cached->result == DIRECTORY_PREVIEW_DIRECTORY ||
+            cached->result == DIRECTORY_PREVIEW_FAILED);
+}
+
+static int find_directory_preview_prefetch_candidate(char *out, size_t outsz,
+                                                     int *rows_out) {
+    int rows = directory_preview_rows();
+
+    if (!out || outsz == 0 || rows <= 0 || info_mode || !config_preview ||
+        entry_count <= 0)
+        return 0;
+
+    for (int step = 0; step <= DIRECTORY_PREVIEW_PREFETCH_RADIUS * 2; step++) {
+        int distance = (step + 1) / 2;
+        int idx;
+        char full[PATH_MAX];
+        char resolved[PATH_MAX];
+        DirectoryPreviewCacheEntry *cached;
+
+        if (step == 0)
+            idx = cursor;
+        else if (step & 1)
+            idx = cursor + distance;
+        else
+            idx = cursor - distance;
+
+        if (idx < 0 || idx >= entry_count)
+            continue;
+        if (entry_is_unmounted_drive(&entries[idx]) ||
+            entries[idx].is_dir == 0)
+            continue;
+
+        join_path(full, cwd_path, entries[idx].name);
+        resolve_media_directory(resolved, sizeof(resolved), full);
+        if (network_ui_path(resolved))
+            continue;
+        cached = directory_preview_cache_peek(resolved, rows);
+        if (cached && directory_preview_cache_fresh(cached))
+            continue;
+        if (directory_preview_worker_pid > 0 &&
+            directory_preview_worker_rows == rows &&
+            strcmp(directory_preview_worker_path, resolved) == 0)
+            continue;
+
+        safe_copy(out, outsz, resolved);
+        if (rows_out)
+            *rows_out = rows;
+        return 1;
+    }
+    return 0;
+}
+
+static int directory_preview_prefetch_available(void) {
+    char path[PATH_MAX];
+    int rows;
+    return directory_preview_worker_pid <= 0 &&
+           find_directory_preview_prefetch_candidate(path, sizeof(path),
+                                                     &rows);
+}
+
+static int background_preview_prefetch_available(void) {
+    return directory_preview_prefetch_available();
+}
+
+static void start_background_preview_prefetch(void) {
+    /* One probe does both jobs: opendir() classifies DT_UNKNOWN entries and,
+     * when they are directories, the same operation fills the preview cache.
+     * Keeping this serial avoids hammering a network mount with parallel
+     * metadata traffic. */
+    if (directory_preview_worker_pid <= 0) {
+        char path[PATH_MAX];
+        int rows;
+        if (find_directory_preview_prefetch_candidate(path, sizeof(path),
+                                                      &rows))
+            (void)start_directory_preview_worker(path, rows);
+    }
+}
+
+
+/* Cached directory previews are pure memory reads.  Refreshing is deliberately
+ * kept out of this drawing path; idle prefetch does that work separately. */
+static int preview_directory(WINDOW *win, const char *path, int w, int h) {
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+
+        clear_window(win);
+        if (!result || result->error) {
+            draw_text(win, 0, 0, w, result ? "[preview unavailable]" : "[loading directory...]");
+        } else if (!S_ISDIR(result->file_stat.st_mode)) {
+            draw_text(win, 0, 0, w, "[not a directory]");
+        } else {
+            for (int i = 0; i < result->count && i < h; i++) {
+                char line[NAME_MAX + 2];
+                snprintf(line, sizeof(line), "%s%s",
+                         result->entries[i].is_dir == 1 ? "/" : " ",
+                         result->entries[i].name);
+                draw_text(win, i, 0, w, line);
+            }
+        }
+        return 1;
+    }
+    DirectoryPreviewCacheEntry *cached =
+        directory_preview_cache_find(path, h);
+
+    if (cached) {
+        const char *line;
+
+        clear_window(win);
+        if (cached->result == DIRECTORY_PREVIEW_FAILED) {
+            draw_text(win, 0, 0, w, "[preview unavailable]");
+            return 1;
+        }
+        if (cached->result != DIRECTORY_PREVIEW_DIRECTORY) {
+            draw_text(win, 0, 0, w, "[not a directory]");
+            return 1;
+        }
+
+        line = cached->text;
+        for (int row = 0; row < h && *line; row++) {
+            const char *nl = strchr(line, '\n');
+            size_t len = nl ? (size_t)(nl - line) : strlen(line);
+            char display[PATH_MAX + 2];
+            if (len >= sizeof(display))
+                len = sizeof(display) - 1;
+            memcpy(display, line, len);
+            display[len] = '\0';
+            draw_text(win, row, 0, w, display);
+            if (!nl)
+                break;
+            line = nl + 1;
+        }
+        return 1;
+    }
+
+    if (!start_directory_preview_worker(path, h)) {
+        clear_window(win);
+        draw_text(win, 0, 0, w, "[cannot start preview]");
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static int write_info_result(int fd, const InfoResult *result) {
+    const char *p = (const char *)result;
+    size_t left = sizeof(*result);
+
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int read_info_result(int fd, InfoResult *result) {
+    char *p = (char *)result;
+    size_t left = sizeof(*result);
+
+    while (left > 0) {
+        ssize_t n = read(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void collect_info_recursive(const char *path, InfoResult *result,
+                                   int count_this_dir) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0) {
+        result->errors++;
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (count_this_dir)
+            result->dirs++;
+
+        DIR *dir = opendir(path);
+        if (!dir) {
+            result->errors++;
+            return;
+        }
+
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char full[PATH_MAX];
+            join_path(full, path, de->d_name);
+            if (!full[0]) {
+                result->errors++;
+                continue;
+            }
+            collect_info_recursive(full, result, 1);
+        }
+        closedir(dir);
+        return;
+    }
+
+    result->files++;
+    if (st.st_size > 0)
+        result->bytes += (uint64_t)st.st_size;
+}
+
+static void reap_cancelled_workers(void) {
+    size_t out = 0;
+
+    for (size_t i = 0; i < cancelled_worker_count; i++) {
+        pid_t pid = cancelled_worker_pids[i];
+        pid_t result;
+
+        do {
+            result = waitpid(pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+
+        if (result == 0)
+            cancelled_worker_pids[out++] = pid;
+    }
+    cancelled_worker_count = out;
+}
+
+static void cancel_worker_without_waiting(pid_t pid) {
+    pid_t result;
+
+    if (pid <= 0)
+        return;
+
+    kill(pid, SIGKILL);
+    do {
+        result = waitpid(pid, NULL, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result != 0)
+        return;
+
+    reap_cancelled_workers();
+    if (cancelled_worker_count == cancelled_worker_capacity) {
+        size_t next_capacity = cancelled_worker_capacity
+                                   ? cancelled_worker_capacity * 2 : 8;
+        pid_t *grown = realloc(cancelled_worker_pids,
+                               next_capacity * sizeof(*grown));
+        if (!grown)
+            return;
+        cancelled_worker_pids = grown;
+        cancelled_worker_capacity = next_capacity;
+    }
+    cancelled_worker_pids[cancelled_worker_count++] = pid;
+}
+
+static void cancel_info_worker(void) {
+    if (info_worker_pid > 0) {
+        cancel_worker_without_waiting(info_worker_pid);
+    }
+    if (info_result_fd >= 0)
+        close(info_result_fd);
+
+    info_worker_pid = -1;
+    info_result_fd = -1;
+    info_worker_path[0] = '\0';
+}
+
+static void start_info_worker(const char *path) {
+    int result_pipe[2];
+
+    if (!path || !*path)
+        return;
+    if (info_worker_pid > 0 && strcmp(info_worker_path, path) == 0)
+        return;
+    if (info_result_ready && strcmp(info_ready_path, path) == 0)
+        return;
+
+    cancel_info_worker();
+    info_result_ready = 0;
+    info_ready_path[0] = '\0';
+
+    if (pipe(result_pipe) != 0)
+        return;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        InfoResult result;
+        memset(&result, 0, sizeof(result));
+        collect_info_recursive(path, &result, 0);
+        write_info_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    if (pid < 0) {
+        close(result_pipe[0]);
+        return;
+    }
+
+    info_worker_pid = pid;
+    info_result_fd = result_pipe[0];
+    safe_copy(info_worker_path, sizeof(info_worker_path), path);
+}
+
+static int check_background_info(void) {
+    if (info_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(info_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    InfoResult result;
+    int have_result = pid == info_worker_pid && info_result_fd >= 0 &&
+                      read_info_result(info_result_fd, &result);
+    if (info_result_fd >= 0)
+        close(info_result_fd);
+    info_result_fd = -1;
+
+    if (have_result && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        info_result = result;
+        safe_copy(info_ready_path, sizeof(info_ready_path), info_worker_path);
+        info_result_ready = 1;
+    }
+
+    info_worker_pid = -1;
+    info_worker_path[0] = '\0';
+    return 1;
+}
+
+static int looks_binary(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+
+    unsigned char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int has_ext(const char *path, const char *ext) {
+    size_t lp = strlen(path);
+    size_t le = strlen(ext);
+    if (lp < le) return 0;
+    return strcasecmp(path + lp - le, ext) == 0;
+}
+
+static int image_file_stamp(const char *path, ImageFileStamp *stamp) {
+    struct stat st;
+
+    if (!path || !stamp || browsing_stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return 0;
+
+    stamp->device = st.st_dev;
+    stamp->inode = st.st_ino;
+    stamp->size = st.st_size;
+    stamp->modified = st.st_mtime;
+#ifdef __APPLE__
+    stamp->modified_nsec = st.st_mtimespec.tv_nsec;
+    stamp->changed = st.st_ctimespec.tv_sec;
+    stamp->changed_nsec = st.st_ctimespec.tv_nsec;
+#else
+    stamp->modified_nsec = st.st_mtim.tv_nsec;
+    stamp->changed = st.st_ctim.tv_sec;
+    stamp->changed_nsec = st.st_ctim.tv_nsec;
+#endif
+    return 1;
+}
+
+static int image_stamps_equal(const ImageFileStamp *a,
+                              const ImageFileStamp *b) {
+    return a && b &&
+           a->device == b->device &&
+           a->inode == b->inode &&
+           a->size == b->size &&
+           a->modified == b->modified &&
+           a->modified_nsec == b->modified_nsec &&
+           a->changed == b->changed &&
+           a->changed_nsec == b->changed_nsec;
+}
+
+/* Ask GIO about both the name and a small signature.  This sends every image
+ * content type to the decoder, including extensionless files and formats that
+ * may be added to FFmpeg later, instead of maintaining an image suffix list. */
+static int path_is_image_file(const char *path) {
+    unsigned char signature[4096];
+    size_t signature_size = 0;
+    gboolean uncertain = FALSE;
+    gchar *content_type;
+    gchar *mime_type;
+    int is_image = 0;
+    FILE *file;
+
+    if (!path || !*path)
+        return 0;
+
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+        if (result && !result->error && !result->text_error) {
+            signature_size = result->text_size < sizeof(signature) ?
+                result->text_size : sizeof(signature);
+            memcpy(signature, result->text, signature_size);
+        }
+    } else {
+        file = fopen(path, "rb");
+        if (file) {
+            signature_size = fread(signature, 1, sizeof(signature), file);
+            fclose(file);
+        }
+    }
+
+    content_type = g_content_type_guess(
+        path,
+        signature_size > 0 ? signature : NULL,
+        signature_size,
+        &uncertain);
+    if (!content_type)
+        return 0;
+
+    mime_type = g_content_type_get_mime_type(content_type);
+    if (g_str_has_prefix(content_type, "image/") ||
+        (mime_type && g_str_has_prefix(mime_type, "image/")))
+        is_image = 1;
+
+    g_free(mime_type);
+    g_free(content_type);
+    return is_image;
+}
+
+static int image_frame_size(int width, int height, size_t *size_out) {
+    size_t pixels;
+
+    if (width <= 0 || height <= 0 || !size_out)
+        return 0;
+
+    if ((size_t)width > SIZE_MAX / (size_t)height)
+        return 0;
+    pixels = (size_t)width * (size_t)height;
+    if (pixels > SIZE_MAX / IMAGE_PREVIEW_CHANNELS)
+        return 0;
+
+    *size_out = pixels * IMAGE_PREVIEW_CHANNELS;
+    return *size_out <= IMAGE_PREVIEW_MAX_BYTES;
+}
+
+static ImageDataFormat image_data_format_for_terminal(void) {
+    return terminal_graphics_protocol == TERMINAL_GRAPHICS_SIXEL ?
+        IMAGE_DATA_RGBA : IMAGE_DATA_PNG;
+}
+
+static void image_preview_pixel_geometry(int columns, int rows,
+                                         int *pixel_width,
+                                         int *pixel_height) {
+    struct winsize size;
+    int cell_width = 10;
+    int cell_height = 20;
+    long long width;
+    long long height;
+    int maximum = terminal_graphics_protocol == TERMINAL_GRAPHICS_SIXEL ?
+        1000 : IMAGE_PREVIEW_MAX_DIMENSION;
+
+    memset(&size, 0, sizeof(size));
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0) {
+        if (size.ws_col > 0 && size.ws_xpixel >= size.ws_col)
+            cell_width = size.ws_xpixel / size.ws_col;
+        if (size.ws_row > 0 && size.ws_ypixel >= size.ws_row)
+            cell_height = size.ws_ypixel / size.ws_row;
+    }
+
+    width = (long long)columns * cell_width;
+    height = (long long)rows * cell_height;
+    if (width > maximum) {
+        height = height * maximum / width;
+        width = maximum;
+    }
+    if (height > maximum) {
+        width = width * maximum / height;
+        height = maximum;
+    }
+
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    *pixel_width = (int)width;
+    *pixel_height = (int)height;
+}
+
+static int image_temporary_fd(void) {
+#if defined(__linux__) && defined(MFD_CLOEXEC)
+    /* Preview workers exchange bounded data through an anonymous in-memory
+     * file on Linux.  Avoiding mkstemp() removes a filesystem operation from
+     * every probe while retaining the seekable descriptor required for image
+     * output larger than a pipe buffer. */
+    int memory_fd = memfd_create("simplefiles-worker", MFD_CLOEXEC);
+    if (memory_fd >= 0)
+        return memory_fd;
+#endif
+
+    const char *directories[] = {
+        getenv("XDG_RUNTIME_DIR"),
+        getenv("TMPDIR"),
+        "/tmp"
+    };
+
+    for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+        char template[PATH_MAX];
+        int fd;
+
+        if (!directories[i] || !directories[i][0])
+            continue;
+        if (snprintf(template, sizeof(template),
+                     "%s/simplefiles-image.XXXXXX", directories[i]) >=
+            (int)sizeof(template))
+            continue;
+
+        fd = mkstemp(template);
+        if (fd < 0)
+            continue;
+
+        unlink(template);
+        int flags = fcntl(fd, F_GETFD);
+        if (flags >= 0)
+            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+        return fd;
+    }
+
+    return -1;
+}
+
+static void clear_image_failure(void) {
+    image_failed_path[0] = '\0';
+    image_failed_width = 0;
+    image_failed_height = 0;
+    memset(&image_failed_stamp, 0, sizeof(image_failed_stamp));
+}
+
+static void remember_image_failure(const char *path, int width, int height,
+                                   const ImageFileStamp *stamp) {
+    safe_copy(image_failed_path, sizeof(image_failed_path), path);
+    image_failed_width = width;
+    image_failed_height = height;
+    if (stamp)
+        image_failed_stamp = *stamp;
+    else
+        memset(&image_failed_stamp, 0, sizeof(image_failed_stamp));
+}
+
+static void cancel_image_worker(void) {
+    if (image_worker_pid > 0) {
+        cancel_worker_without_waiting(image_worker_pid);
+    }
+    if (image_result_fd >= 0)
+        close(image_result_fd);
+
+    image_worker_pid = -1;
+    image_result_fd = -1;
+    image_worker_path[0] = '\0';
+    image_worker_width = 0;
+    image_worker_height = 0;
+    image_worker_format = IMAGE_DATA_RGBA;
+    memset(&image_worker_stamp, 0, sizeof(image_worker_stamp));
+}
+
+static void cancel_media_workers_for_unmount(void) {
+    /*
+     * Both workers can have an input file or directory open.  Kill them before
+     * asking the OS to unmount, then give the kernel a short bounded window to
+     * close their descriptors.  This cannot freeze the interface indefinitely.
+     */
+    dismiss_image_overlay();
+    cancel_directory_type_worker();
+    cancel_directory_preview_worker();
+    cancel_info_worker();
+    cancel_image_worker();
+
+    for (int attempt = 0; attempt < 25 && cancelled_worker_count > 0;
+         attempt++) {
+        reap_cancelled_workers();
+        if (cancelled_worker_count == 0)
+            break;
+        usleep(10000);
+    }
+}
+
+static void clear_image_preview(void) {
+    cancel_image_worker();
+    free(image_ready_pixels);
+    image_ready_pixels = NULL;
+    image_ready_bytes = 0;
+    image_ready_path[0] = '\0';
+    image_ready_width = 0;
+    image_ready_height = 0;
+    image_ready_format = IMAGE_DATA_RGBA;
+    memset(&image_ready_stamp, 0, sizeof(image_ready_stamp));
+    image_overlay_requested = 0;
+    clear_image_failure();
+}
+
+static int start_image_worker(const char *path, int width, int height,
+                              const ImageFileStamp *stamp) {
+    static int decoder_available = -1;
+    char filter[256];
+    int output_fd;
+    pid_t pid;
+    ImageDataFormat format = image_data_format_for_terminal();
+
+    if (!path || !*path || width <= 0 || height <= 0 || !stamp)
+        return 0;
+
+    if (image_worker_pid > 0 &&
+        strcmp(image_worker_path, path) == 0 &&
+        image_worker_width == width && image_worker_height == height &&
+        image_worker_format == format &&
+        image_stamps_equal(&image_worker_stamp, stamp))
+        return 1;
+
+    cancel_image_worker();
+    clear_image_failure();
+
+    if (decoder_available < 0)
+        decoder_available = ssp_command_available("ffmpeg");
+    if (!decoder_available) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    size_t rgba_size;
+    if (!image_frame_size(width, height, &rgba_size)) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+    (void)rgba_size;
+
+    if (snprintf(filter, sizeof(filter),
+                 "scale=%d:%d:force_original_aspect_ratio=decrease:"
+                 "force_divisible_by=1,format=rgba,"
+                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black@0",
+                 width, height, width, height) >=
+        (int)sizeof(filter)) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    output_fd = image_temporary_fd();
+    if (output_fd < 0) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        int devnull;
+
+        if (chdir("/") != 0)
+            _exit(127);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (info_result_fd >= 0)
+            close(info_result_fd);
+        if (paste_result_fd >= 0)
+            close(paste_result_fd);
+        if (delete_result_fd >= 0)
+            close(delete_result_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+        if (dup2(output_fd, STDOUT_FILENO) < 0)
+            _exit(126);
+        if (output_fd > STDERR_FILENO)
+            close(output_fd);
+        if (devnull > STDERR_FILENO && devnull != output_fd)
+            close(devnull);
+
+        if (format == IMAGE_DATA_PNG) {
+            execlp("ffmpeg", "ffmpeg",
+                   "-nostdin",
+                   "-hide_banner",
+                   "-loglevel", "error",
+                   "-i", path,
+                   "-frames:v", "1",
+                   "-vf", filter,
+                   "-f", "image2pipe",
+                   "-c:v", "png",
+                   "pipe:1",
+                   (char *)NULL);
+        } else {
+            execlp("ffmpeg", "ffmpeg",
+                   "-nostdin",
+                   "-hide_banner",
+                   "-loglevel", "error",
+                   "-i", path,
+                   "-frames:v", "1",
+                   "-vf", filter,
+                   "-f", "rawvideo",
+                   "-pix_fmt", "rgba",
+                   "pipe:1",
+                   (char *)NULL);
+        }
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0) {
+        close(output_fd);
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    image_worker_pid = pid;
+    image_result_fd = output_fd;
+    safe_copy(image_worker_path, sizeof(image_worker_path), path);
+    image_worker_width = width;
+    image_worker_height = height;
+    image_worker_format = format;
+    image_worker_stamp = *stamp;
+    debug_log("image worker started pid=%ld path=\"%s\" pixels=%dx%d "
+              "format=%s", (long)pid, path, width, height,
+              format == IMAGE_DATA_PNG ? "png" : "rgba");
+    return 1;
+}
+
+static int read_image_frame(int fd, unsigned char *pixels, size_t size) {
+    size_t offset = 0;
+
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return 0;
+
+    while (offset < size) {
+        ssize_t count = read(fd, pixels + offset, size - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int check_background_image(void) {
+    int status = 0;
+    pid_t pid;
+    pid_t completed_pid;
+
+    if (image_worker_pid <= 0)
+        return 0;
+
+    completed_pid = image_worker_pid;
+    pid = waitpid(completed_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    char completed_path[PATH_MAX];
+    int completed_width = image_worker_width;
+    int completed_height = image_worker_height;
+    ImageDataFormat completed_format = image_worker_format;
+    ImageFileStamp completed_stamp = image_worker_stamp;
+    size_t frame_size = 0;
+    unsigned char *pixels = NULL;
+    int have_frame = 0;
+
+    safe_copy(completed_path, sizeof(completed_path), image_worker_path);
+    if (pid == image_worker_pid && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0 && image_result_fd >= 0) {
+        struct stat output_stat;
+
+        if (fstat(image_result_fd, &output_stat) == 0 &&
+            output_stat.st_size > 0 &&
+            output_stat.st_size <= (off_t)IMAGE_PREVIEW_MAX_BYTES) {
+            frame_size = (size_t)output_stat.st_size;
+            if (completed_format == IMAGE_DATA_RGBA) {
+                size_t expected_size = 0;
+                if (!image_frame_size(completed_width, completed_height,
+                                      &expected_size) ||
+                    frame_size != expected_size)
+                    frame_size = 0;
+            }
+
+            if (frame_size > 0) {
+                pixels = malloc(frame_size);
+                if (pixels && read_image_frame(image_result_fd, pixels,
+                                               frame_size)) {
+                    static const unsigned char png_signature[] = {
+                        0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'
+                    };
+                    have_frame = completed_format == IMAGE_DATA_RGBA ||
+                        (frame_size >= sizeof(png_signature) &&
+                         memcmp(pixels, png_signature,
+                                sizeof(png_signature)) == 0);
+                }
+            }
+        }
+    }
+
+    if (image_result_fd >= 0)
+        close(image_result_fd);
+    image_result_fd = -1;
+    image_worker_pid = -1;
+    image_worker_path[0] = '\0';
+    image_worker_width = 0;
+    image_worker_height = 0;
+    image_worker_format = IMAGE_DATA_RGBA;
+    memset(&image_worker_stamp, 0, sizeof(image_worker_stamp));
+
+    if (have_frame) {
+        free(image_ready_pixels);
+        image_ready_pixels = pixels;
+        image_ready_bytes = frame_size;
+        safe_copy(image_ready_path, sizeof(image_ready_path), completed_path);
+        image_ready_width = completed_width;
+        image_ready_height = completed_height;
+        image_ready_format = completed_format;
+        image_ready_stamp = completed_stamp;
+        image_ready_generation++;
+        if (image_ready_generation == 0)
+            image_ready_generation++;
+        clear_image_failure();
+        debug_log("image worker ready path=\"%s\" bytes=%zu",
+                  completed_path, frame_size);
+    } else {
+        free(pixels);
+        remember_image_failure(completed_path, completed_width,
+                               completed_height, &completed_stamp);
+        debug_log("image worker failed path=\"%s\" status=%d",
+                  completed_path, status);
+    }
+
+    return 1;
+}
+static int preview_image(WINDOW *win, const char *path, int columns,
+                         int rows) {
+    ImageFileStamp stamp;
+    ImageDataFormat format;
+    int pixel_width;
+    int pixel_height;
+
+    if (terminal_graphics_protocol == TERMINAL_GRAPHICS_NONE) {
+        cancel_image_worker();
+        return 0;
+    }
+
+    if (!image_file_stamp(path, &stamp)) {
+        cancel_image_worker();
+        return 0;
+    }
+
+    format = image_data_format_for_terminal();
+    image_preview_pixel_geometry(columns, rows, &pixel_width, &pixel_height);
+
+    if (image_ready_pixels && strcmp(image_ready_path, path) == 0 &&
+        image_ready_width == pixel_width &&
+        image_ready_height == pixel_height &&
+        image_ready_format == format &&
+        image_stamps_equal(&image_ready_stamp, &stamp)) {
+        image_overlay_requested = 1;
+        image_overlay_requested_generation = image_ready_generation;
+        image_overlay_requested_columns = columns;
+        image_overlay_requested_rows = rows;
+        return 1;
+    }
+
+    if (strcmp(image_failed_path, path) == 0 &&
+        image_failed_width == pixel_width &&
+        image_failed_height == pixel_height &&
+        image_stamps_equal(&image_failed_stamp, &stamp))
+        return 0;
+
+    if (!start_image_worker(path, pixel_width, pixel_height, &stamp) ||
+        strcmp(image_failed_path, path) == 0)
+        return 0;
+
+    draw_text(win, 0, 0, columns, "[loading high-resolution image...]");
+    return 1;
+}
+
+static void preview_file(WINDOW *win, const char *path, int w, int h) {
+    cancel_image_worker();
+
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+
+        if (!result || result->error || result->text_error) {
+            draw_text(win, 0, 0, w, result ? "[preview unavailable]" : "[loading preview...]");
+        } else if (result->binary) {
+            draw_text(win, 0, 0, w, "binary/unknown file");
+        } else {
+            char text[NETWORK_TEXT_BYTES + 1];
+            char *line = text;
+
+            memcpy(text, result->text, result->text_size);
+            text[result->text_size] = '\0';
+            for (int row = 0; row < h && *line; row++) {
+                char *newline = strchr(line, '\n');
+
+                if (newline)
+                    *newline = '\0';
+                draw_text(win, row, 0, w, line);
+                if (!newline)
+                    break;
+                line = newline + 1;
+            }
+        }
+        return;
+    }
+
+    if (has_ext(path, ".pdf") || has_ext(path, ".djvu") || has_ext(path, ".epub") || has_ext(path, ".mobi")) {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "binary/unknown file");
+            draw_text(win, 0, 0, w, buf);
+            snprintf(buf, sizeof(buf), "size: %lld bytes", (long long)st.st_size);
+            draw_text(win, 1, 0, w, buf);
+        }
+        return;
+    }
+
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        draw_text(win, 0, 0, w, "[cannot stat file]");
+        return;
+    }
+    if (looks_binary(path)) {
+        char line[PATH_MAX];
+
+        snprintf(line, sizeof(line), "binary/unknown file");
+        draw_text(win, 0, 0, w, line);
+
+        snprintf(line, sizeof(line), "size: %lld bytes", (long long)st.st_size);
+        draw_text(win, 1, 0, w, line);
+
+        return;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        draw_text(win, 0, 0, w, "[cannot open file]");
+        return;
+    }
+
+    char line[4096];
+    int row = 0;
+    int maxrows = h;
+
+    while (row < maxrows && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        draw_text(win, row, 0, w, line);
+        row++;
+    }
+
+    fclose(f);
+}
+
+static void draw_drive_capacity(WINDOW *win, int w, int h, int *row, const char *path) {
+    struct statvfs vfs;
+    char line[256];
+    char totalbuf[64];
+    char usedbuf[64];
+    char freebuf[64];
+
+    if (!row || *row >= h)
+        return;
+
+    if (*row < h)
+        (*row)++;
+    if (*row < h)
+        draw_text(win, (*row)++, 0, w, "Drive");
+
+    if (browsing_statvfs(path, &vfs) != 0) {
+        if (*row < h)
+            draw_text(win, (*row)++, 0, w, "Capacity:    unavailable");
+        return;
+    }
+
+    uint64_t block_size = vfs.f_frsize ? (uint64_t)vfs.f_frsize
+                                       : (uint64_t)vfs.f_bsize;
+    uint64_t total_bytes = (uint64_t)vfs.f_blocks * block_size;
+    uint64_t free_bytes = (uint64_t)vfs.f_bavail * block_size;
+    uint64_t used_bytes = total_bytes >= free_bytes
+                            ? total_bytes - free_bytes : 0;
+
+    human_size_u64(total_bytes, totalbuf, sizeof(totalbuf));
+    human_size_u64(used_bytes, usedbuf, sizeof(usedbuf));
+    human_size_u64(free_bytes, freebuf, sizeof(freebuf));
+
+    snprintf(line, sizeof(line), "Capacity:    %s", totalbuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+    snprintf(line, sizeof(line), "Used:        %s", usedbuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+    snprintf(line, sizeof(line), "Free:        %s", freebuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+}
+
+static void draw_info_pane(WINDOW *win, int w, int h) {
+    clear_window(win);
+    if (entry_count == 0) {
+        draw_text(win, 0, 0, w, "empty");
+        return;
+    }
+
+    if (entry_is_unmounted_drive(&entries[cursor])) {
+        DriveRecord *record = entry_drive_record(&entries[cursor]);
+        draw_text(win, 0, 0, w, "Unmounted removable drive");
+        if (h > 2 && record)
+            draw_text(win, 2, 0, w, record->device);
+        if (h > 4)
+            draw_text(win, 4, 0, w, "Press Enter or Right to mount");
+        return;
+    }
+
+#ifdef __FreeBSD__
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            cancel_info_worker();
+            draw_text(win, 0, 0, w, "Unmounted removable drive");
+            if (h > 2 && media_device[0])
+                draw_text(win, 2, 0, w, media_device);
+            if (h > 4)
+                draw_text(win, 4, 0, w, "Press Enter or Right to mount");
+            return;
+        }
+    }
+#endif
+
+    char full[PATH_MAX];
+    char path[PATH_MAX];
+    char line[PATH_MAX + 128];
+    struct stat st;
+    int row = 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    {
+        DriveRecord *record = mounted_drive_at_exact_path(full);
+
+        if (record) {
+            cancel_info_worker();
+            draw_text(win, row++, 0, w, "Mounted removable drive");
+            if (row < h) row++;
+            if (row < h)
+                draw_text(win, row++, 0, w,
+                          record->name[0] ? record->name : entries[cursor].name);
+            if (row < h)
+                draw_text(win, row++, 0, w,
+                          record->device[0] ? record->device : "device unknown");
+            if (row < h) row++;
+            if (row < h)
+                draw_text(win, row++, 0, w,
+                          "Press Enter or Right to open");
+            return;
+        }
+    }
+    resolve_media_directory(path, sizeof(path), full);
+
+    if (browsing_lstat(path, &st) != 0) {
+        draw_text(win, 0, 0, w, errno == EAGAIN ? "[loading details...]" : "[cannot stat item]");
+        return;
+    }
+
+    draw_text(win, row++, 0, w, S_ISDIR(st.st_mode) ? "Directory" : "File");
+    if (row < h) row++;
+
+    char modes[11];
+    mode_string(st.st_mode, modes);
+    snprintf(line, sizeof(line), "Permissions: %s", modes);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    snprintf(line, sizeof(line), "Owner UID:   %ju", (uintmax_t)st.st_uid);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Group GID:   %ju", (uintmax_t)st.st_gid);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    struct tm tmv;
+    char timebuf[64] = "unknown";
+    if (localtime_r(&st.st_mtime, &tmv))
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M", &tmv);
+    snprintf(line, sizeof(line), "Modified:    %s", timebuf);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    if (row < h) row++;
+
+    if (!S_ISDIR(st.st_mode)) {
+        char sizebuf[64];
+        human_size((long long)st.st_size, sizebuf, sizeof(sizebuf));
+        snprintf(line, sizeof(line), "Size:        %s", sizebuf);
+        if (row < h) draw_text(win, row++, 0, w, line);
+        snprintf(line, sizeof(line), "Bytes:       %lld", (long long)st.st_size);
+        if (row < h) draw_text(win, row++, 0, w, line);
+        draw_drive_capacity(win, w, h, &row, path);
+        return;
+    }
+
+    start_info_worker(path);
+    if (!info_result_ready || strcmp(info_ready_path, path) != 0) {
+        draw_text(win, row++, 0, w, "Calculating...");
+        draw_drive_capacity(win, w, h, &row, path);
+        return;
+    }
+
+    char sizebuf[64];
+    human_size_u64(info_result.bytes, sizebuf, sizeof(sizebuf));
+    snprintf(line, sizeof(line), "Files:       %llu",
+             (unsigned long long)info_result.files);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Directories: %llu",
+             (unsigned long long)info_result.dirs);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Total size:  %s", sizebuf);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Total bytes: %llu",
+             (unsigned long long)info_result.bytes);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    if (info_result.errors > 0) {
+        snprintf(line, sizeof(line), "Unreadable:  %llu",
+                 (unsigned long long)info_result.errors);
+        if (row < h) draw_text(win, row++, 0, w, line);
+    }
+
+    draw_drive_capacity(win, w, h, &row, path);
+}
+
+static void draw_preview_pane(WINDOW *win, int w, int h) {
+    if (entry_count == 0) {
+        clear_window(win);
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "empty");
+        return;
+    }
+
+    if (entry_is_unmounted_drive(&entries[cursor])) {
+        clear_window(win);
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "[unmounted removable drive]");
+        if (h > 2)
+            draw_text(win, 2, 0, w, "Press Enter or Right to mount");
+        return;
+    }
+
+#ifdef __FreeBSD__
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            (void)media_device;
+            clear_window(win);
+            cancel_image_worker();
+            draw_text(win, 0, 0, w, "[unmounted removable drive]");
+            if (h > 2)
+                draw_text(win, 2, 0, w, "Press Enter or Right to mount");
+            return;
+        }
+    }
+#endif
+
+    char full[PATH_MAX];
+    char preview_path[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+    {
+        DriveRecord *record = mounted_drive_at_exact_path(full);
+
+        if (record) {
+            clear_window(win);
+            cancel_image_worker();
+            draw_text(win, 0, 0, w, "[mounted removable drive]");
+            if (h > 2)
+                draw_text(win, 2, 0, w,
+                          record->device[0] ? record->device :
+                                              "Press Enter or Right to open");
+            if (h > 4)
+                draw_text(win, 4, 0, w, "Press Enter or Right to open");
+            return;
+        }
+    }
+    resolve_media_directory(preview_path, sizeof(preview_path), full);
+
+    if (!config_preview) {
+        clear_window(win);
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "[preview disabled]");
+        return;
+    }
+
+    if (config_preview_lines < h)
+        h = config_preview_lines;
+
+    if (network_ui_path(preview_path) && !network_read(preview_path)) {
+        clear_window(win);
+        draw_text(win, 0, 0, w, "[loading preview...]");
+        return;
+    }
+
+    /* For DT_UNKNOWN, the directory-preview probe is also the type probe.
+     * That avoids the former stat-then-opendir double round trip. */
+    if (entries[cursor].is_dir < 0) {
+        DirectoryPreviewCacheEntry *cached =
+            directory_preview_cache_peek(preview_path, h);
+
+        if (cached && cached->result == DIRECTORY_PREVIEW_DIRECTORY)
+            entries[cursor].is_dir = 1;
+        else if (cached &&
+                 cached->result == DIRECTORY_PREVIEW_NOT_DIRECTORY)
+            entries[cursor].is_dir = 0;
+        else if (cached && cached->result == DIRECTORY_PREVIEW_FAILED) {
+            clear_window(win);
+            cancel_image_worker();
+            draw_text(win, 0, 0, w, "[preview unavailable]");
+            return;
+        } else {
+            cancel_image_worker();
+            (void)preview_directory(win, preview_path, w, h);
+            return;
+        }
+    }
+
+    if (entries[cursor].is_dir == 1) {
+        cancel_image_worker();
+        (void)preview_directory(win, preview_path, w, h);
+    } else if (path_is_regular(preview_path)) {
+        clear_window(win);
+        cancel_directory_preview_worker();
+        if (path_is_image_file(preview_path)) {
+            if (!preview_image(win, preview_path, w, h))
+                draw_info_pane(win, w, h);
+        } else {
+            preview_file(win, preview_path, w, h);
+        }
+    } else {
+        clear_window(win);
+        cancel_directory_preview_worker();
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "[not a regular file]");
+    }
+}
+
+static void mode_string(mode_t mode, char *out) {
+    out[0] = S_ISDIR(mode) ? 'd' :
+             S_ISLNK(mode) ? 'l' :
+             S_ISCHR(mode) ? 'c' :
+             S_ISBLK(mode) ? 'b' :
+             S_ISFIFO(mode) ? 'p' :
+             S_ISSOCK(mode) ? 's' : '-';
+
+    const char chars[] = "rwxrwxrwx";
+
+    for (int i = 0; i < 9; i++)
+        out[i + 1] = (mode & (1 << (8 - i))) ? chars[i] : '-';
+
+    out[10] = '\0';
+}
+
+static void human_size(long long bytes, char *out, size_t outsz) {
+    const char *units[] = {"B", "K", "M", "G", "T"};
+    double size = (double)bytes;
+    int unit = 0;
+
+    while (size >= 1024.0 && unit < 4) {
+        size /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0)
+        snprintf(out, outsz, "%lld %s", bytes, units[unit]);
+    else
+        snprintf(out, outsz, "%.1f %s", size, units[unit]);
+}
+
+static void draw_top_bar(void) {
+    if (!top_win) return;
+
+    werase(top_win);
+    wattrset(top_win, A_NORMAL);
+
+    for (int x = 0; x < COLS; x++)
+        mvwaddch(top_win, 0, x, ' ');
+
+    char header[PATH_MAX + NAME_MAX + 2];
+
+    if (entry_count > 0) {
+        if (strcmp(cwd_path, "/") == 0)
+            snprintf(header, sizeof(header), "/%s", entries[cursor].name);
+        else
+            snprintf(header, sizeof(header), "%s/%s", cwd_path, entries[cursor].name);
+    } else {
+        snprintf(header, sizeof(header), "%s", cwd_path);
+    }
+
+#ifdef __FreeBSD__
+    {
+        char display_header[sizeof(header)];
+        if (freebsd_display_media_path(display_header, sizeof(display_header),
+                                       header))
+            safe_copy(header, sizeof(header), display_header);
+    }
+#endif
+
+    mvwaddnstr(top_win, 0, 0, header, COLS - 1);
+}
+
+static void human_size_u64(uint64_t bytes, char *out, size_t outsz) {
+    const char *units[] = {"B", "K", "M", "G", "T"};
+    double size = (double)bytes;
+    int unit = 0;
+
+    while (size >= 1024.0 && unit < 4) {
+        size /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0)
+        snprintf(out, outsz, "%llu %s", (unsigned long long)bytes, units[unit]);
+    else
+        snprintf(out, outsz, "%.1f %s", size, units[unit]);
+}
+
+static const char *paste_spinner_frame(void) {
+    static const char *frames[] = {"◐", "◓", "◑", "◒"};
+    struct timespec ts;
+    unsigned long long ticks;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return frames[0];
+
+    ticks = (unsigned long long)ts.tv_sec * 4ULL +
+            (unsigned long long)(ts.tv_nsec / 250000000L);
+
+    return frames[ticks % 4ULL];
+}
+
+static void progress_bar(char *out, size_t outsz, int pct) {
+    int width = 20;
+    int filled;
+
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    filled = (pct * width + 50) / 100;
+    if (filled > width) filled = width;
+
+    if (outsz == 0)
+        return;
+
+    size_t pos = 0;
+    if (pos + 1 < outsz) out[pos++] = '[';
+    for (int i = 0; i < width && pos + 1 < outsz; i++)
+        out[pos++] = i < filled ? '#' : '-';
+    if (pos + 1 < outsz) out[pos++] = ']';
+    out[pos] = '\0';
+}
+
+static void indeterminate_bar(char *out, size_t outsz) {
+    const int width = 20;
+    const int block = 5;
+    struct timespec ts;
+    long tick;
+    int span;
+    int pos;
+    size_t used = 0;
+
+    if (!out || outsz == 0)
+        return;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    tick = ts.tv_sec * 5L + ts.tv_nsec / 200000000L;
+    span = width - block;
+    pos = span > 0 ? (int)(tick % (2 * span)) : 0;
+    if (pos > span)
+        pos = 2 * span - pos;
+
+    if (used + 1 < outsz)
+        out[used++] = '[';
+    for (int i = 0; i < width && used + 1 < outsz; i++)
+        out[used++] = (i >= pos && i < pos + block) ? '#' : '-';
+    if (used + 1 < outsz)
+        out[used++] = ']';
+    out[used] = '\0';
+}
+
+
+static void cancel_capacity_worker(void) {
+    if (capacity_worker_pid > 0)
+        cancel_worker_without_waiting(capacity_worker_pid);
+    if (capacity_result_fd >= 0)
+        close(capacity_result_fd);
+
+    capacity_worker_pid = -1;
+    capacity_result_fd = -1;
+    capacity_worker_path[0] = '\0';
+}
+
+static int capacity_cache_fresh(const char *path) {
+    struct timespec now;
+
+    if (!capacity_ready_valid || !path ||
+        strcmp(capacity_ready_path, path) != 0)
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 1;
+    return now.tv_sec - capacity_ready_time.tv_sec < 30;
+}
+
+static void request_capacity_refresh(const char *path) {
+    int fds[2];
+    pid_t pid;
+
+    if (!path || !*path || capacity_cache_fresh(path))
+        return;
+    if (capacity_worker_pid > 0 &&
+        strcmp(capacity_worker_path, path) == 0)
+        return;
+
+    cancel_capacity_worker();
+    if (pipe(fds) != 0)
+        return;
+
+    pid = fork();
+    if (pid == 0) {
+        CapacityResult result;
+        ssize_t written;
+
+        close(fds[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        memset(&result, 0, sizeof(result));
+        result.ok = statvfs(path, &result.vfs) == 0;
+        do {
+            written = write(fds[1], &result, sizeof(result));
+        } while (written < 0 && errno == EINTR);
+        close(fds[1]);
+        _exit(result.ok && written == (ssize_t)sizeof(result) ? 0 : 1);
+    }
+
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return;
+    }
+
+    capacity_worker_pid = pid;
+    capacity_result_fd = fds[0];
+    safe_copy(capacity_worker_path, sizeof(capacity_worker_path), path);
+}
+
+static int check_background_capacity(void) {
+    CapacityResult result;
+    int status;
+    pid_t done;
+    ssize_t got;
+
+    if (capacity_worker_pid <= 0)
+        return 0;
+
+    done = waitpid(capacity_worker_pid, &status, WNOHANG);
+    if (done == 0)
+        return 0;
+    if (done < 0) {
+        cancel_capacity_worker();
+        return 0;
+    }
+
+    memset(&result, 0, sizeof(result));
+    got = read(capacity_result_fd, &result, sizeof(result));
+    close(capacity_result_fd);
+    capacity_result_fd = -1;
+    capacity_worker_pid = -1;
+
+    if (got == (ssize_t)sizeof(result) && result.ok) {
+        capacity_ready_vfs = result.vfs;
+        capacity_ready_valid = 1;
+        safe_copy(capacity_ready_path, sizeof(capacity_ready_path),
+                  capacity_worker_path);
+        (void)clock_gettime(CLOCK_MONOTONIC, &capacity_ready_time);
+    } else if (strcmp(capacity_ready_path, capacity_worker_path) == 0) {
+        capacity_ready_valid = 0;
+    }
+    capacity_worker_path[0] = '\0';
+    return 1;
+}
+
+static void draw_status(WINDOW *win, int w) {
+    if (!win) return;
+
+    wbkgdset(win, (chtype)' ' | A_REVERSE);
+    werase(win);
+    wattrset(win, A_REVERSE);
+
+    if (command_mode) {
+        draw_command_status(win, w);
+        return;
+    }
+
+    leaveok(win, TRUE);
+    (void)curs_set(0);
+
+    if (search_mode) {
+        char line[1200];
+        snprintf(line, sizeof(line), "/%s", search_query);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+    if (pending_delete) {
+        draw_text(win, 0, 0, w, "delete to trash? y/N");
+        return;
+    }
+
+    if (pending_permanent_delete) {
+        draw_text(win, 0, 0, w,
+                  "PERMANENTLY delete with authorization? y/N");
+        return;
+    }
+
+    if (pending_empty_trash) {
+        draw_text(win, 0, 0, w, "empty trash permanently? y/N");
+        return;
+    }
+
+    if (delete_worker_pid > 0 && delete_progress && delete_progress->active) {
+        char bar[32];
+        char line[256];
+        int pct = 0;
+
+        if (delete_progress->stage == 1) {
+            snprintf(line, sizeof(line), "%s scanning items for delete...",
+                     paste_spinner_frame());
+        } else if (delete_progress->total_bytes > 0) {
+            uint64_t done = delete_progress->done_bytes;
+            uint64_t total = delete_progress->total_bytes;
+            char donebuf[64];
+            char totalbuf[64];
+            if (done > total)
+                done = total;
+
+            /* gio trash performs each top-level move as one opaque operation;
+             * it does not expose byte progress.  Do not lie with a frozen 0%:
+             * animate an indeterminate bar until the first item completes,
+             * then show genuine aggregate progress between completed items. */
+            if (done == 0 && delete_progress->done_items == 0) {
+                indeterminate_bar(bar, sizeof(bar));
+                human_size_u64(total, totalbuf, sizeof(totalbuf));
+                snprintf(line, sizeof(line), "%s moving to trash %s (%s)",
+                         paste_spinner_frame(), bar, totalbuf);
+            } else {
+                pct = (int)((done * 100ULL) / total);
+                progress_bar(bar, sizeof(bar), pct);
+                human_size_u64(done, donebuf, sizeof(donebuf));
+                human_size_u64(total, totalbuf, sizeof(totalbuf));
+                snprintf(line, sizeof(line), "%s delete %d%% %s %s / %s",
+                         paste_spinner_frame(), pct, bar, donebuf, totalbuf);
+            }
+        } else {
+            uint64_t done = delete_progress->done_items;
+            uint64_t total = delete_progress->total_items;
+            if (total > 0)
+                pct = (int)((done * 100ULL) / total);
+            progress_bar(bar, sizeof(bar), pct);
+            snprintf(line, sizeof(line), "%s delete %d%% %s %llu / %llu items",
+                     paste_spinner_frame(), pct, bar,
+                     (unsigned long long)done, (unsigned long long)total);
+        }
+
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+    if (paste_worker_pid > 0 && paste_progress && paste_progress->active) {
+        uint64_t done = paste_progress->done_bytes;
+        uint64_t done_items = paste_progress->done_items;
+        uint64_t total_items = paste_progress->total_items;
+        char donebuf[64];
+        char line[256];
+        human_size_u64(done, donebuf, sizeof(donebuf));
+
+        if (done > 0)
+            snprintf(line, sizeof(line), "%s pasting... %llu / %llu items, %s copied",
+                     paste_spinner_frame(),
+                     (unsigned long long)done_items,
+                     (unsigned long long)total_items, donebuf);
+        else
+            snprintf(line, sizeof(line), "%s pasting... %llu / %llu items",
+                     paste_spinner_frame(),
+                     (unsigned long long)done_items,
+                     (unsigned long long)total_items);
+
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+    if (file_operation_pid > 0) {
+        const char *activity = "working";
+        char line[128];
+
+        if (file_operation_kind == FILE_OPERATION_COMPRESS)
+            activity = "compressing";
+        else if (file_operation_kind == FILE_OPERATION_EXTRACT)
+            activity = "extracting";
+        else if (file_operation_kind == FILE_OPERATION_EMPTY_TRASH)
+            activity = "emptying trash";
+        else if (file_operation_kind == FILE_OPERATION_UNMOUNT)
+            activity = "unmounting drive";
+#ifdef __FreeBSD__
+        else if (file_operation_kind == FILE_OPERATION_MOUNT)
+            activity = "mounting drive";
+#endif
+        snprintf(line, sizeof(line), "%s %s in background...",
+                 paste_spinner_frame(), activity);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+    if (entry_count <= 0) {
+        draw_text(win, 0, 0, w, message[0] ? message : "empty");
+        return;
+    }
+
+    if (entry_is_unmounted_drive(&entries[cursor])) {
+        DriveRecord *record = entry_drive_record(&entries[cursor]);
+        char line[PATH_MAX + 512];
+        snprintf(line, sizeof(line),
+                 "%s  %s  %d/%d  %s",
+                 record ? record->device : "removable drive",
+                 record && mounting_drive_id[0] &&
+                     strcmp(mounting_drive_id, record->id) == 0
+                     ? (mounting_drive_activity[0] ?
+                        mounting_drive_activity : "mounting...")
+                     : "Enter/Right mounts",
+                 cursor + 1, entry_count, message);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+#ifdef __FreeBSD__
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            char line[PATH_MAX + 512];
+            snprintf(line, sizeof(line),
+                     "%s  %s  %d/%d  %s",
+                     media_device[0] ? media_device : "removable drive",
+                     "Enter/Right mounts",
+                     cursor + 1, entry_count, message);
+            draw_text(win, 0, 0, w, line);
+            return;
+        }
+    }
+#endif
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+
+    struct stat st;
+    if (browsing_lstat(full, &st) != 0) {
+        draw_text(win, 0, 0, w, message[0] ? message : "[cannot stat]");
+        return;
+    }
+
+    char perms[16];
+    mode_string(st.st_mode, perms);
+
+    char owner[64];
+    char group[64];
+
+    snprintf(owner, sizeof(owner), "%ju", (uintmax_t)st.st_uid);
+    snprintf(group, sizeof(group), "%ju", (uintmax_t)st.st_gid);
+
+    char date[64];
+    struct tm *tm = localtime(&st.st_mtime);
+    if (tm)
+        strftime(date, sizeof(date), "%Y-%m-%d %H:%M", tm);
+    else
+        snprintf(date, sizeof(date), "?");
+
+    char sizebuf[64];
+    human_size((long long)st.st_size, sizebuf, sizeof(sizebuf));
+
+    char freebuf[64] = "?";
+    request_capacity_refresh(cwd_path);
+    if (capacity_ready_valid &&
+        strcmp(capacity_ready_path, cwd_path) == 0) {
+        unsigned long long free_bytes =
+            (unsigned long long)capacity_ready_vfs.f_bavail *
+            (unsigned long long)capacity_ready_vfs.f_frsize;
+        human_size((long long)free_bytes, freebuf, sizeof(freebuf));
+    }
+
+    char pending[32] = "";
+    if (pending_key == 'y')
+        snprintf(pending, sizeof(pending), " pending:y");
+    else if (pending_key == 'd')
+        snprintf(pending, sizeof(pending), " pending:d");
+    else if (pending_key == 'p')
+        snprintf(pending, sizeof(pending), " pending:p");
+    else if (pending_key == 'c')
+        snprintf(pending, sizeof(pending), " pending:c");
+
+    char line[PATH_MAX + 512];
+    snprintf(line, sizeof(line),
+             "%s  %s %s  %s  %s  selected:%d  free:%s  %d/%d%s  %s",
+             perms, owner, group, date, sizebuf,
+             selected_count, freebuf,
+             entry_count > 0 ? cursor + 1 : 0, entry_count,
+             pending, message);
+
+    draw_text(win, 0, 0, w, line);
+}
+
+static void destroy_windows(void) {
+    if (top_win) {
+        delwin(top_win);
+        top_win = NULL;
+    }
+
+    if (parent_win) {
+        delwin(parent_win);
+        parent_win = NULL;
+    }
+
+    if (current_win) {
+        delwin(current_win);
+        current_win = NULL;
+    }
+
+    if (preview_win) {
+        delwin(preview_win);
+        preview_win = NULL;
+    }
+
+    if (status_win) {
+        delwin(status_win);
+        status_win = NULL;
+    }
+}
+
+static void setup_windows(void) {
+    if (LINES == last_lines && COLS == last_cols && current_win && status_win)
+        return;
+
+    clear_active_image_overlay();
+    abandon_image_overlay();
+    destroy_windows();
+
+    clear();
+    erase();
+    refresh();
+    clearok(stdscr, TRUE);
+
+    last_lines = LINES;
+    last_cols = COLS;
+
+    int pane_y = 1;
+    int pane_h = LINES - 2;
+    if (pane_h < 1)
+        pane_h = 1;
+
+    top_win = newwin(1, COLS, 0, 0);
+    status_win = newwin(1, COLS, LINES - 1, 0);
+
+    if (COLS < 62) {
+        single_pane_mode = 1;
+        current_win = newwin(pane_h, COLS, pane_y, 0);
+    } else {
+        single_pane_mode = 0;
+
+        int gap = 1;
+        int x1 = 0;
+
+        if (!preview_pane_visible) {
+            int w1 = COLS / 3;
+            int x2 = w1 + gap;
+            int w2 = COLS - x2;
+
+            if (w1 < 18 || w2 < 24) {
+                single_pane_mode = 1;
+                current_win = newwin(pane_h, COLS, pane_y, 0);
+            } else {
+                parent_win = newwin(pane_h, w1, pane_y, x1);
+                current_win = newwin(pane_h, w2, pane_y, x2);
+            }
+        } else {
+            int usable = COLS - 2 * gap;
+            int w1 = usable / 3;
+            int w2 = usable / 3;
+            int x2 = w1 + gap;
+            int x3 = x2 + w2 + gap;
+            int w3 = COLS - x3;
+
+            if (w1 < 18 || w2 < 24 || w3 < 20) {
+                single_pane_mode = 1;
+                current_win = newwin(pane_h, COLS, pane_y, 0);
+            } else {
+                parent_win = newwin(pane_h, w1, pane_y, x1);
+                current_win = newwin(pane_h, w2, pane_y, x2);
+                preview_win = newwin(pane_h, w3, pane_y, x3);
+            }
+        }
+    }
+
+    if (top_win) leaveok(top_win, TRUE);
+    if (top_win) idlok(top_win, FALSE);
+    if (parent_win) {
+        leaveok(parent_win, TRUE);
+        idlok(parent_win, FALSE);
+    }
+    if (current_win) {
+        leaveok(current_win, TRUE);
+        idlok(current_win, FALSE);
+        keypad(current_win, TRUE);
+        nodelay(current_win, FALSE);
+        wtimeout(current_win, -1);
+    }
+    if (preview_win) {
+        leaveok(preview_win, TRUE);
+        idlok(preview_win, FALSE);
+    }
+    if (status_win) {
+        leaveok(status_win, TRUE);
+        idlok(status_win, FALSE);
+    }
+}
+
+static void draw_ui(void) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+    image_overlay_requested = 0;
+
+    int h = LINES - 2;
+
+    if (single_pane_mode) {
+        draw_current_pane(current_win, COLS, h);
+        wnoutrefresh(current_win);
+    } else {
+        int ph, pw, ch, cw;
+
+        getmaxyx(parent_win, ph, pw);
+        getmaxyx(current_win, ch, cw);
+
+        draw_parent_pane(parent_win, pw, ph);
+        draw_current_pane(current_win, cw, ch);
+
+        wnoutrefresh(parent_win);
+        wnoutrefresh(current_win);
+
+        if (preview_win) {
+            int vh, vw;
+            getmaxyx(preview_win, vh, vw);
+            if (info_mode)
+                draw_info_pane(preview_win, vw, vh);
+            else
+                draw_preview_pane(preview_win, vw, vh);
+            wnoutrefresh(preview_win);
+        }
+    }
+
+    draw_top_bar();
+    wnoutrefresh(top_win);
+
+    draw_status(status_win, COLS);
+    wnoutrefresh(status_win);
+
+    present_screen();
+}
+
+/* When the viewport advances, many middle-pane lines shift by one row.
+ * ncurses otherwise turns that pattern into a terminal scrolling-region
+ * command, which also moves the static left pane before repairing it.  Commit
+ * one middle-pane row at a time so the optimizer cannot scroll shared rows. */
+static void draw_scrolled_current_pane(WINDOW *win, int w, int h) {
+    begin_screen_update();
+
+    draw_top_bar();
+    wnoutrefresh(top_win);
+    doupdate();
+
+    untouchwin(win);
+    for (int row = 0; row < h; row++) {
+        draw_current_row(win, w, row, top + row);
+        wnoutrefresh(win);
+        doupdate();
+        untouchwin(win);
+    }
+
+    end_screen_update();
+}
+
+/* Cursor movement must not wait for removable-drive I/O.  Paint the list and
+ * path immediately; the preview and metadata are refreshed after input has
+ * been idle for a short time. */
+static void draw_navigation_ui(int old_cursor, int old_top) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+
+    int ch, cw;
+    getmaxyx(current_win, ch, cw);
+    adjust_current_view(ch);
+
+    if (top != old_top) {
+        draw_scrolled_current_pane(current_win, cw, ch);
+        return;
+    }
+
+    /* A cursor move within the existing viewport changes at most two rows:
+     * the row losing reverse video and the row gaining it.  Repainting the
+     * entire pane here was the dominant interactive drawing cost. */
+    int old_row = old_cursor - top;
+    int new_row = cursor - top;
+
+    if (old_row >= 0 && old_row < ch)
+        draw_current_row(current_win, cw, old_row, old_cursor);
+    if (new_row >= 0 && new_row < ch && new_row != old_row)
+        draw_current_row(current_win, cw, new_row, cursor);
+
+    wnoutrefresh(current_win);
+
+    draw_top_bar();
+    wnoutrefresh(top_win);
+    present_screen();
+}
+
+static void draw_deferred_details(void) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+    image_overlay_requested = 0;
+
+    if (!single_pane_mode && preview_win) {
+        int vh, vw;
+        getmaxyx(preview_win, vh, vw);
+        if (info_mode)
+            draw_info_pane(preview_win, vw, vh);
+        else
+            draw_preview_pane(preview_win, vw, vh);
+        wnoutrefresh(preview_win);
+    }
+
+    draw_status(status_win, COLS);
+    wnoutrefresh(status_win);
+    present_screen();
+}
+
+/* Network completions paint only their visible pane. In particular, they
+ * leave the navigation debounce alone while the user is still scrolling. */
+static void draw_network_updates(int changed, int details_pending) {
+    int listing_changed = changed & (NETWORK_DIRECTORY_CHANGED |
+                                     NETWORK_PARENT_CHANGED);
+
+    if (listing_changed) {
+        attrset(A_NORMAL);
+        bkgdset(' ' | A_NORMAL);
+        setup_windows();
+        if (changed & NETWORK_DIRECTORY_CHANGED) {
+            int ch, cw;
+
+            getmaxyx(current_win, ch, cw);
+            draw_current_pane(current_win, cw, ch);
+            wnoutrefresh(current_win);
+            draw_top_bar();
+            wnoutrefresh(top_win);
+        }
+        if ((changed & NETWORK_PARENT_CHANGED) && parent_win) {
+            int ph, pw;
+
+            getmaxyx(parent_win, ph, pw);
+            draw_parent_pane(parent_win, pw, ph);
+            wnoutrefresh(parent_win);
+        }
+    }
+    if ((changed & NETWORK_DETAILS_CHANGED) && !details_pending)
+        draw_deferred_details();
+    else if (listing_changed)
+        present_screen();
+}
+
+static void draw_directory_type_completion(void) {
+    int ch, cw;
+
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+    getmaxyx(current_win, ch, cw);
+    draw_current_pane(current_win, cw, ch);
+    wnoutrefresh(current_win);
+    draw_top_bar();
+    wnoutrefresh(top_win);
+    draw_status(status_win, COLS);
+    wnoutrefresh(status_win);
+    present_screen();
+}
+
+/* A background DT_UNKNOWN probe changes at most one list marker and, when it
+ * belongs to the highlighted row, the preview pane.  Paint exactly those
+ * surfaces so resolved '/' markers appear immediately without disturbing
+ * selection stars or paying for a full-pane redraw. */
+static void draw_directory_preview_completion(int changed_entry,
+                                              int redraw_preview) {
+    int touched = 0;
+
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+
+    if (changed_entry >= top && changed_entry < entry_count && current_win) {
+        int ch, cw;
+        int row = changed_entry - top;
+
+        getmaxyx(current_win, ch, cw);
+        if (row >= 0 && row < ch) {
+            draw_current_row(current_win, cw, row, changed_entry);
+            wnoutrefresh(current_win);
+            touched = 1;
+        }
+    }
+
+    if (redraw_preview && !single_pane_mode && preview_win) {
+        int vh, vw;
+
+        image_overlay_requested = 0;
+        getmaxyx(preview_win, vh, vw);
+        if (info_mode)
+            draw_info_pane(preview_win, vw, vh);
+        else
+            draw_preview_pane(preview_win, vw, vh);
+        wnoutrefresh(preview_win);
+        touched = 1;
+    }
+
+    if (touched)
+        present_screen();
+}
+
+static void enter_dir(void) {
+    if (entry_count == 0) return;
+    if (!current_entry_is_dir()) return;
+
+#ifdef __FreeBSD__
+    int freebsd_media_needs_mount =
+        !entry_is_unmounted_drive(&entries[cursor]) &&
+        freebsd_media_entry_should_avoid_io(cwd_path, entries[cursor].name,
+                                            NULL, 0);
+#endif
+
+    if (entry_is_unmounted_drive(&entries[cursor])
+#ifdef __FreeBSD__
+        || freebsd_media_needs_mount
+#endif
+        ) {
+#ifdef __FreeBSD__
+        if (strcmp(cwd_path, "/media") == 0) {
+            char next[PATH_MAX];
+            char mount_device[PATH_MAX];
+            char existing_device[PATH_MAX];
+            char drive_id[PATH_MAX];
+
+            existing_device[0] = '\0';
+            if (!freebsd_mount_request_for_entry(
+                    &entries[cursor], next, sizeof(next),
+                    mount_device, sizeof(mount_device),
+                    drive_id, sizeof(drive_id))) {
+                set_message("mount failed: drive identity unavailable");
+                return;
+            }
+
+            if (freebsd_exact_automounted_media_device(
+                    next, existing_device, sizeof(existing_device)) &&
+                same_device_path(existing_device, mount_device)) {
+                remember_current_cursor();
+                if (chdir(next) != 0) {
+                    set_message("mounted drive is unavailable");
+                    return;
+                }
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), next);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                restore_dir_cursor(cwd_path);
+                return;
+            }
+            if (existing_device[0] &&
+                !same_device_path(existing_device, mount_device)) {
+                if (!safe_join3(next, sizeof(next), "/media/", "",
+                                base_name(mount_device))) {
+                    set_message("mount failed: drive identity unavailable");
+                    return;
+                }
+            }
+
+            (void)freebsd_start_media_mount(
+                next, mount_device, drive_id, entries[cursor].name);
+            return;
+        }
+#endif
+        if (entry_is_unmounted_drive(&entries[cursor]))
+            mount_volume_entry(&entries[cursor]);
+        else
+            set_message("press Enter or Right to mount the drive first");
+        return;
+    }
+
+    remember_current_cursor();
+
+    char next[PATH_MAX];
+    char resolved_next[PATH_MAX];
+    join_path(next, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved_next, sizeof(resolved_next), next);
+
+    if (startup_chdir_resolved(resolved_next)) {
+        cursor = 0;
+        top = 0;
+        load_dir(cwd_path);
+        restore_dir_cursor(cwd_path);
+    }
+}
+
+__attribute__((unused)) static int nvim_file_type(const char *path) {
+    const char *ext = path_extension(path);
+
+    if (!ext)
+        return 0;
+
+    return
+        strcasecmp(ext, ".txt") == 0  ||
+        strcasecmp(ext, ".md") == 0   ||
+        strcasecmp(ext, ".markdown") == 0 ||
+        strcasecmp(ext, ".c") == 0    ||
+        strcasecmp(ext, ".h") == 0    ||
+        strcasecmp(ext, ".cpp") == 0  ||
+        strcasecmp(ext, ".hpp") == 0  ||
+        strcasecmp(ext, ".cc") == 0   ||
+        strcasecmp(ext, ".py") == 0   ||
+        strcasecmp(ext, ".sh") == 0   ||
+        strcasecmp(ext, ".conf") == 0 ||
+        strcasecmp(ext, ".ini") == 0  ||
+        strcasecmp(ext, ".log") == 0;
+}
+
+static void launch_file(void) {
+    if (entry_count == 0)
+        return;
+
+    int is_directory = current_entry_is_dir();
+    if (entries[cursor].is_dir < 0)
+        return;
+    if (is_directory) {
+        enter_dir();
+        return;
+    }
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+
+    debug_log("launch file before def_prog_mode/endwin path=%s", full);
+    dismiss_image_overlay();
+    def_prog_mode();
+    endwin();
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        const char *ext = path_extension(full);
+
+        if (chdir(cwd_path) != 0)
+            _exit(1);
+
+        if (config_terminal_mode && (extension_in_text_list(full) || (!ext && !looks_binary(full)))) {
+
+            if (config_editor_command[0]) {
+                char cmd[PATH_MAX * 4 + 1024];
+                snprintf(cmd, sizeof(cmd), "%s ", config_editor_command);
+                shell_quote_append(cmd, sizeof(cmd), full);
+
+                execl("/bin/sh",
+                      "sh",
+                      "-c",
+                      cmd,
+                      (char *)NULL);
+            }
+
+            execlp("nvim", "nvim", full, (char *)NULL);
+            execlp("vim",  "vim",  full, (char *)NULL);
+            execlp("vi",   "vi",   full, (char *)NULL);
+            execlp("nano", "nano", full, (char *)NULL);
+
+            _exit(127);
+        }
+
+        const char *rule = find_open_rule(full);
+
+        if (rule) {
+            char cmd[PATH_MAX * 4 + 1024];
+
+            snprintf(cmd, sizeof(cmd), "%s ", rule);
+            shell_quote_append(cmd, sizeof(cmd), full);
+
+            execl("/bin/sh",
+                  "sh",
+                  "-c",
+                  cmd,
+                  (char *)NULL);
+
+            _exit(127);
+        }
+
+        setsid();
+
+        pid_t grandchild = fork();
+        if (grandchild < 0)
+            _exit(127);
+        if (grandchild > 0)
+            _exit(0);
+
+        char open_path[PATH_MAX];
+        prepare_open_path(open_path, sizeof(open_path), full);
+        exec_default_open_detached(open_path);
+    }
+
+    debug_log("launch file child pid=%ld", (long)pid);
+
+    if (pid > 0) {
+        int status = 0;
+        wait_for_child(pid, &status, "launch file");
+    }
+
+    if (!redraw_after_child("launch file"))
+        return;
+
+    if (pid < 0)
+        set_message("launch failed");
+    else
+        set_message("returned");
+}
+
+static void go_parent(void) {
+    if (strcmp(cwd_path, "/") == 0) return;
+
+    remember_current_cursor();
+
+    char old[PATH_MAX];
+    strncpy(old, cwd_path, PATH_MAX - 1);
+    old[PATH_MAX - 1] = '\0';
+
+#ifdef __FreeBSD__
+    const char *old_for_name = old;
+    char display_old[PATH_MAX];
+    if (freebsd_display_media_path(display_old, sizeof(display_old), old))
+        old_for_name = display_old;
+
+    char *base = strrchr(old_for_name, '/');
+#else
+    char *base = strrchr(old, '/');
+#endif
+    char old_name[NAME_MAX + 1] = "";
+
+    if (base) {
+        strncpy(old_name, base + 1, NAME_MAX);
+        old_name[NAME_MAX] = '\0';
+    }
+
+    char parent[PATH_MAX];
+    safe_copy(parent, sizeof(parent), old);
+    char *parent_slash = strrchr(parent, '/');
+    if (parent_slash == parent)
+        parent[1] = '\0';
+    else if (parent_slash)
+        *parent_slash = '\0';
+    if (startup_chdir_resolved(parent)) {
+        load_dir(cwd_path);
+
+        for (int i = 0; i < entry_count; i++) {
+            if (strcmp(entries[i].name, old_name) == 0) {
+                cursor = i;
+                break;
+            }
+        }
+
+        top = cursor - 5;
+        if (top < 0) top = 0;
+    }
+}
+
+
+
+
+static void search_step(int direction) {
+    if (search_len <= 0) {
+        set_message("no search");
+        return;
+    }
+
+    if (entry_count <= 0) {
+        set_message("nothing to search");
+        return;
+    }
+
+    for (int step = 1; step <= entry_count; step++) {
+        int idx = cursor + (direction * step);
+
+        while (idx < 0)
+            idx += entry_count;
+
+        idx %= entry_count;
+
+        if (strcasestr(entries[idx].name, search_query)) {
+            cursor = idx;
+            set_message("found");
+            return;
+        }
+    }
+
+    set_message("not found");
+}
+
+static void execute_search(void) {
+    if (search_len <= 0) {
+        set_message("search canceled");
+        return;
+    }
+
+    search_step(1);
+}
+
+static void handle_search_input(wint_t ch, int is_key_code) {
+    if (!is_key_code && ch == 27) {
+        search_mode = 0;
+        search_query[0] = '\0';
+        search_len = 0;
+        set_message("search canceled");
+        return;
+    }
+
+    if ((!is_key_code && (ch == '\n' || ch == '\r')) ||
+        (is_key_code && ch == KEY_ENTER)) {
+        search_mode = 0;
+        execute_search();
+        return;
+    }
+
+    if ((is_key_code && ch == KEY_BACKSPACE) ||
+        (!is_key_code && (ch == 127 || ch == 8))) {
+        if (search_len > 0) {
+            search_len = text_previous_offset(
+                search_query, search_len, search_len);
+            search_query[search_len] = '\0';
+        }
+        return;
+    }
+
+    if (!is_key_code) {
+        int search_cursor = search_len;
+
+        (void)text_insert_wchar(search_query, sizeof(search_query),
+                                &search_len, &search_cursor, ch);
+    }
+}
+
+
+static void launch_shell_here(void) {
+    const char *shell = getenv("SHELL");
+    if (!shell || shell[0] == '\0')
+        shell = "/bin/sh";
+
+    debug_log("shell before def_prog_mode/endwin shell=%s", shell);
+    dismiss_image_overlay();
+    def_prog_mode();
+    endwin();
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        if (chdir(cwd_path) != 0)
+            _exit(127);
+
+        printf("\n");
+        printf("========================================\n");
+        printf("  SIMPLEFILES SHELL\n");
+        printf("  Type: exit\n");
+        printf("  to return to Simplefiles\n");
+        printf("========================================\n\n");
+        fflush(stdout);
+
+        execlp(shell, shell, (char *)NULL);
+        _exit(127);
+    }
+
+    debug_log("shell child pid=%ld", (long)pid);
+
+    if (pid > 0) {
+        int status = 0;
+        wait_for_child(pid, &status, "shell");
+    }
+
+    if (!redraw_after_child("shell"))
+        return;
+
+    if (pid < 0)
+        set_message("shell failed");
+    else
+        set_message("returned from shell");
+}
+
+
+
+static int simplefiles_picker_write(const char *outpath) {
+    if (!outpath || !*outpath) return 1;
+    if (cursor < 0 || cursor >= entry_count) return 1;
+    if (current_entry_is_dir()) return 1;
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+    if (!full[0]) return 1;
+
+    FILE *f = fopen(outpath, "w");
+    if (!f) return 1;
+
+    fprintf(f, "%s\n", full);
+    fclose(f);
+    return 0;
+}
+
+static void handle_normal_input(int ch) {
+    switch (ch) {
+        case KEY_UP:
+        case 'k':
+            if (cursor > 0) cursor--;
+            break;
+
+        case KEY_DOWN:
+        case 'j':
+            if (cursor < entry_count - 1) cursor++;
+            break;
+
+        case KEY_NPAGE:
+            cursor += 10;
+            if (cursor >= entry_count) cursor = entry_count - 1;
+            break;
+
+        case KEY_PPAGE:
+            cursor -= 10;
+            if (cursor < 0) cursor = 0;
+            break;
+
+        case 'h':
+        case KEY_LEFT:
+            go_parent();
+            break;
+
+        case 'l':
+        case KEY_RIGHT:
+            if (picker_mode) {
+                if (entry_count > 0 && current_entry_is_dir())
+                    enter_dir();
+                else
+                    set_message("Enter picks file");
+                break;
+            }
+            launch_file();
+            break;
+
+        case '\n':
+        case '\r':
+        case KEY_ENTER:
+            if (picker_mode) {
+                if (cursor >= 0 && cursor < entry_count && !current_entry_is_dir()) {
+                    int rc = simplefiles_picker_write(picker_out);
+                    dismiss_image_overlay();
+                    clear_image_preview();
+                    endwin();
+                    exit(rc);
+                }
+                if (entry_count > 0 && current_entry_is_dir())
+                    enter_dir();
+                else
+                    set_message("choose a file");
+                break;
+            }
+            launch_file();
+            break;
+
+        case ' ':
+            if (entry_count > 0) {
+                if (entry_is_unmounted_drive(&entries[cursor])) {
+                    set_message("press Enter or Right to mount the drive");
+                    break;
+                }
+                char full[PATH_MAX];
+                join_path(full, cwd_path, entries[cursor].name);
+                toggle_selected(full);
+
+                if (cursor < entry_count - 1)
+                    cursor++;
+            }
+            break;
+
+        case 'v':
+            select_all_toggle();
+            break;
+
+        case 'V':
+            invert_selection();
+            break;
+
+        case 'y':
+        case 'd':
+        case 'c':
+            if (entry_count > 0 &&
+                entry_is_unmounted_drive(&entries[cursor])) {
+                set_message("press Enter or Right to mount the drive first");
+                break;
+            }
+            pending_key = ch;
+            break;
+
+        case 'p':
+            pending_key = 'p';
+            break;
+
+        case 'r':
+            preview_pane_visible = !preview_pane_visible;
+            cancel_directory_preview_worker();
+            cancel_image_worker();
+            clear_active_image_overlay();
+            abandon_image_overlay();
+            last_cols = 0;
+            set_message(preview_pane_visible ? "preview pane shown" :
+                                               "preview pane hidden");
+            break;
+
+        case ':':
+            start_command("");
+            break;
+
+        case 'o':
+            if (entry_count > 0 &&
+                entry_is_unmounted_drive(&entries[cursor])) {
+                set_message("press Enter or Right to mount the drive first");
+                break;
+            }
+            start_command("openwith ");
+            break;
+
+        case 't':
+            launch_shell_here();
+            break;
+
+        case '/':
+            start_search();
+            break;
+
+        case 'n':
+            search_step(1);
+            break;
+
+        case 'N':
+            search_step(-1);
+            break;
+
+        case '.':
+            show_hidden = !show_hidden;
+            load_dir(cwd_path);
+            break;
+
+        case 'i':
+            info_mode = !info_mode;
+            if (info_mode)
+                cancel_image_worker();
+            else
+                cancel_info_worker();
+            info_result_ready = 0;
+            info_ready_path[0] = '\0';
+            set_message(info_mode ? "info mode" : "preview mode");
+            break;
+
+        case 'q':
+            exit_reason = "q";
+            running = 0;
+            break;
+    }
+}
+
+static void handle_command_input(wint_t ch, int is_key_code) {
+    if (!is_key_code && ch == 27) {
+        reset_command();
+        set_message("command canceled");
+        return;
+    }
+
+    if ((!is_key_code && (ch == '\n' || ch == '\r')) ||
+        (is_key_code && ch == KEY_ENTER)) {
+        if (picker_mode) {
+            if (cursor >= 0 && cursor < entry_count && !current_entry_is_dir()) {
+                int rc = simplefiles_picker_write(picker_out);
+                dismiss_image_overlay();
+                clear_image_preview();
+                endwin();
+                exit(rc);
+            }
+            set_message("choose a file");
+            return;
+        }
+
+        char cmd[sizeof(command)];
+        char entry_path[sizeof(command_entry_path)];
+        strncpy(cmd, command, sizeof(cmd) - 1);
+        cmd[sizeof(cmd) - 1] = '\0';
+        safe_copy(entry_path, sizeof(entry_path), command_entry_path);
+
+        reset_command();
+
+        execute_command(cmd, entry_path);
+        return;
+    }
+
+    clamp_command_cursor();
+
+    if (is_key_code && ch == KEY_LEFT) {
+        if (command_cursor > 0)
+            command_cursor = text_previous_offset(
+                command, command_len, command_cursor);
+        return;
+    }
+
+    if (is_key_code && ch == KEY_RIGHT) {
+        if (command_cursor < command_len)
+            command_cursor = text_next_offset(
+                command, command_len, command_cursor);
+        return;
+    }
+
+    if ((is_key_code && ch == KEY_HOME) || (!is_key_code && ch == 1)) {
+        command_cursor = 0;
+        return;
+    }
+
+    if ((is_key_code && ch == KEY_END) || (!is_key_code && ch == 5)) {
+        command_cursor = command_len;
+        return;
+    }
+
+    if ((is_key_code && ch == KEY_BACKSPACE) ||
+        (!is_key_code && (ch == 127 || ch == 8))) {
+        if (command_cursor > 0) {
+            int previous = text_previous_offset(
+                command, command_len, command_cursor);
+            int removed = command_cursor - previous;
+
+            memmove(command + previous,
+                    command + command_cursor,
+                    (size_t)(command_len - command_cursor + 1));
+            command_len -= removed;
+            command_cursor = previous;
+        }
+        return;
+    }
+
+    if ((is_key_code && ch == KEY_DC) || (!is_key_code && ch == 4)) {
+        if (command_cursor < command_len) {
+            int next = text_next_offset(
+                command, command_len, command_cursor);
+            int removed = next - command_cursor;
+
+            memmove(command + command_cursor,
+                    command + next,
+                    (size_t)(command_len - next + 1));
+            command_len -= removed;
+        }
+        return;
+    }
+
+    if (!is_key_code)
+        (void)text_insert_wchar(command, sizeof(command), &command_len,
+                                &command_cursor, ch);
+}
+
+static void handle_input(wint_t ch, int is_key_code) {
+    if (command_mode) {
+        handle_command_input(ch, is_key_code);
+        return;
+    }
+
+    if (search_mode) {
+        handle_search_input(ch, is_key_code);
+        return;
+    }
+
+    /* Normal-mode bindings are ASCII plus ncurses key codes.  A printable
+     * Unicode character whose value happens to equal KEY_DOWN (and friends)
+     * must not be mistaken for a function key. */
+    if (!is_key_code && ch > 127)
+        return;
+
+    if (ch == 'a') {
+        start_command("mkdir ");
+        return;
+    }
+
+    if (pending_empty_trash) {
+        pending_empty_trash = 0;
+
+        if (ch == 'y')
+            empty_trash_now();
+        else
+            set_message("empty trash canceled");
+
+        return;
+    }
+
+    if (pending_permanent_delete) {
+        pending_permanent_delete = 0;
+        if (ch == 'y')
+            confirm_permanent_delete();
+        else
+            set_message("permanent delete canceled");
+        return;
+    }
+
+    if (pending_delete) {
+        pending_delete = 0;
+
+        if (ch == 'y')
+            confirm_delete();
+        else
+            set_message("delete canceled");
+
+        return;
+    }
+
+    if (pending_key) {
+        int old_pending = pending_key;
+        pending_key = 0;
+
+        if (old_pending == 'y' && ch == 'y') {
+            yank_or_cut('y');
+            return;
+        }
+
+        if (old_pending == 'd' && ch == 'd') {
+            yank_or_cut('d');
+            return;
+        }
+
+        if (old_pending == 'd' && ch == 'D') {
+            arm_delete();
+            return;
+        }
+
+        if (old_pending == 'p' && ch == 'p') {
+            paste_clipboard();
+            return;
+        }
+
+        if (old_pending == 'c' && ch == 'w') {
+            start_rename_command();
+            return;
+        }
+
+        handle_normal_input(ch);
+        return;
+    }
+
+    handle_normal_input(ch);
+}
+
+
+int main(int argc, char **argv) {
+    int curses_started = 0;
+    int consecutive_errors = 0;
+    int details_pending = 0;
+    int details_warmup_pending = 0;
+    int lock_result;
+    const char *startup_path = NULL;
+
+    setlocale(LC_ALL, "");
+    network_ui_pid = getpid();
+
+    if (argc >= 3 && strcmp(argv[1], "--pick") == 0) {
+        picker_mode = 1;
+        snprintf(picker_out, sizeof picker_out, "%s", argv[2]);
+        if (argc >= 4)
+            startup_path = argv[3];
+    } else if (argc >= 2) {
+        startup_path = argv[1];
+    }
+
+    load_config();
+
+    if (!startup_set_directory(startup_path)) {
+        fprintf(stderr, "simplefiles: cannot open directory: %s\n",
+                startup_path ? startup_path : "");
+        return 1;
+    }
+
+    start_debug_log(argv[0]);
+
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        exit_reason = "non-tty startup";
+        debug_log("exit reason=%s", exit_reason);
+        fprintf(stderr, "simplefiles: refusing to run without a terminal on stdin and stdout\n");
+        if (debug_file)
+            fclose(debug_file);
+        return 1;
+    }
+
+    lock_result = acquire_instance_lock();
+    if (lock_result <= 0) {
+        exit_reason = lock_result < 0 ? "same tty instance" : "instance lock error";
+        debug_log("exit reason=%s", exit_reason);
+        fprintf(stderr, "simplefiles: %s\n",
+                lock_result < 0 ? "already running on this terminal" :
+                                  "could not create same-terminal instance lock");
+        if (debug_file)
+            fclose(debug_file);
+        return 1;
+    }
+
+    initscr();
+    debug_log("after initscr");
+    curses_started = 1;
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
+    if (!install_signal_handlers()) {
+        exit_reason = "signal setup failed";
+        running = 0;
+    }
+    clearok(stdscr, FALSE);
+    noecho();
+    cbreak();
+    nonl();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, FALSE);
+    wtimeout(stdscr, -1);  // block forever until keypress
+
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+    }
+
+    terminal_graphics_protocol = detect_terminal_graphics();
+    debug_log("terminal graphics protocol=%s",
+              terminal_graphics_name(terminal_graphics_protocol));
+
+    curs_set(0);
+    leaveok(stdscr, TRUE);
+
+    /*
+     * Paint the filesystem immediately.  GIO volume-monitor startup can
+     * involve desktop/D-Bus discovery and must not sit on the visible
+     * application startup path.
+     */
+    load_dir(cwd_path);
+    debug_log("after load_dir");
+
+    debug_log("before initial draw_ui");
+    clearok(stdscr, TRUE);
+    draw_ui();
+    debug_log("after initial draw_ui");
+
+    /*
+     * Removable-drive discovery is secondary to opening the file manager.
+     * Initialize it only after the first frame is already on screen.
+     */
+    init_volume_monitor();
+
+    wint_t ch;
+    int input_status;
+    int input_is_key_code;
+    int first_getch = 1;
+
+    while (running && !stop_requested) {
+        int directory_refresh_timeout = 0;
+        int directory_prefetch_timeout = 0;
+
+        reap_cancelled_workers();
+        draw_network_updates(check_network_updates(), details_pending);
+        if (process_volume_monitor_events()) {
+            details_pending = 0;
+            details_warmup_pending = 0;
+            draw_ui();
+        }
+        if (check_background_delete()) {
+            details_pending = 0;
+            details_warmup_pending = 0;
+            draw_ui();
+        }
+        if (check_background_paste()) {
+            details_pending = 0;
+            details_warmup_pending = 0;
+            draw_ui();
+        }
+        if (check_background_file_operation()) {
+            details_pending = 0;
+            details_warmup_pending = 0;
+            draw_ui();
+        }
+        /* Applying the completed scan re-sorts the provisional DT_UNKNOWN
+         * rows.  Defer that one atomic list update while navigation is in
+         * flight so it can never interrupt key repeat. */
+        if (!details_pending && check_background_directory_types())
+            draw_directory_type_completion();
+        if (check_background_info() && !details_pending) {
+            draw_deferred_details();
+        }
+        {
+            int preview_changed = check_background_directory_preview();
+            int changed_entry = directory_preview_changed_entry;
+            int redraw_preview = preview_changed && !details_pending;
+
+            if (redraw_preview) {
+                details_pending = 0;
+                details_warmup_pending = 0;
+            }
+            if (redraw_preview || changed_entry >= 0)
+                draw_directory_preview_completion(changed_entry,
+                                                  redraw_preview);
+        }
+        if (check_background_capacity() && !details_pending) {
+            draw_deferred_details();
+        }
+        if (check_background_image() && !details_pending) {
+            draw_deferred_details();
+        }
+
+        if (!terminal_is_available()) {
+            exit_reason = "lost tty";
+            break;
+        }
+
+        if (details_pending) {
+            wtimeout(current_win, details_warmup_pending ?
+                     DIRECTORY_PREVIEW_WARMUP_MS :
+                     DIRECTORY_PREVIEW_SETTLE_MS);
+        } else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                   file_operation_pid > 0 || info_worker_pid > 0 ||
+                   capacity_worker_pid > 0 || image_worker_pid > 0 ||
+                   network_pending()) {
+            wtimeout(current_win, 100);
+        } else if (directory_preview_worker_pid > 0) {
+            /* The child is invisible; polling only reaps it and never paints
+             * unless it completed the highlighted preview or resolved one
+             * visible row marker. */
+            wtimeout(current_win, DIRECTORY_PREVIEW_POLL_MS);
+        } else if (background_preview_prefetch_available()) {
+            /* Absolutely no prefetch work happens until input has been quiet
+             * for this interval.  Rapid navigation retains the two-row path. */
+            wtimeout(current_win, DIRECTORY_PREVIEW_WARMUP_MS);
+            directory_prefetch_timeout = 1;
+        } else if (directory_type_worker_pid > 0) {
+            wtimeout(current_win, DIRECTORY_PREVIEW_POLL_MS);
+        } else {
+            wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
+            directory_refresh_timeout = 1;
+        }
+
+        if (first_getch) {
+            debug_log("before first getch");
+            first_getch = 0;
+        }
+        input_status = wget_wch(current_win, &ch);
+
+        if (input_status == ERR) {
+            if (details_pending) {
+                if (details_warmup_pending) {
+                    /* Cached folders can paint after one quiet 25 ms window.
+                     * An uncached probe waits for the full navigation debounce
+                     * so key repeat never creates a fork/cancel storm. */
+                    details_warmup_pending = 0;
+                    if (highlighted_directory_preview_is_cached()) {
+                        details_pending = 0;
+                        draw_deferred_details();
+                        continue;
+                    }
+                    continue;
+                }
+                details_pending = 0;
+                details_warmup_pending = 0;
+                wtimeout(current_win, -1);
+                (void)request_highlighted_directory_preview();
+                draw_deferred_details();
+                continue;
+            }
+            if (stop_requested) {
+                exit_reason = "signal";
+                break;
+            }
+            if (!terminal_is_available()) {
+                exit_reason = "lost tty";
+                break;
+            }
+            if (directory_prefetch_timeout) {
+                consecutive_errors = 0;
+                start_background_preview_prefetch();
+                continue;
+            }
+            if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                file_operation_pid > 0 || info_worker_pid > 0 ||
+                capacity_worker_pid > 0 || image_worker_pid > 0 ||
+                network_pending()) {
+                consecutive_errors = 0;
+                if (status_win) {
+                    draw_status(status_win, COLS);
+                    wnoutrefresh(status_win);
+                    present_screen();
+                }
+                continue;
+            }
+            if (directory_preview_worker_pid > 0 ||
+                directory_type_worker_pid > 0) {
+                /* Prefetch is invisible.  Do not repaint the status line just
+                 * because a preview probe is still running. */
+                consecutive_errors = 0;
+                continue;
+            }
+            if (directory_refresh_timeout) {
+                consecutive_errors = 0;
+#ifdef __APPLE__
+                if (macos_drive_snapshot_changed()) {
+                    drive_state_dirty = 1;
+                    continue;
+                }
+#endif
+#ifdef __FreeBSD__
+                if (freebsd_recover_if_unmounted_media_cwd()) {
+                    draw_ui();
+                    continue;
+                }
+#endif
+                if (loaded_directory_changed(cwd_path)) {
+                    refresh_loaded_directory();
+                    draw_ui();
+                }
+                continue;
+            }
+            consecutive_errors++;
+            if (consecutive_errors >= 20) {
+                exit_reason = "getch ERR storm";
+                break;
+            }
+            napms(25);
+            continue;
+        }
+        consecutive_errors = 0;
+        input_is_key_code = input_status == KEY_CODE_YES;
+
+        if (input_is_key_code && ch == KEY_RESIZE) {
+            details_pending = 0;
+            details_warmup_pending = 0;
+            destroy_windows();
+            last_lines = 0;
+            last_cols = 0;
+            clear();
+            clearok(stdscr, TRUE);
+            draw_ui();
+            continue;
+        }
+
+        int old_cursor = cursor;
+        int old_top = top;
+        int old_selected_count = selected_count;
+        char old_cwd[PATH_MAX];
+        safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
+        int scroll_key = !command_mode && !search_mode && !pending_delete &&
+                         !pending_permanent_delete &&
+                         !pending_empty_trash && !pending_key &&
+                         ((input_is_key_code &&
+                           (ch == KEY_UP || ch == KEY_DOWN ||
+                            ch == KEY_NPAGE || ch == KEY_PPAGE)) ||
+                          (!input_is_key_code &&
+                           (ch == 'j' || ch == 'k')));
+
+        handle_input(ch, input_is_key_code);
+
+        if (stop_requested) {
+            exit_reason = "signal";
+            break;
+        }
+        if (running) {
+            int same_directory = strcmp(old_cwd, cwd_path) == 0;
+            int selection_changed = selected_count != old_selected_count ||
+                                    (!input_is_key_code &&
+                                     (ch == 'v' || ch == 'V'));
+            int list_interaction = cursor != old_cursor ||
+                                   selection_changed || scroll_key;
+
+            if (same_directory && list_interaction) {
+                if (selection_changed) {
+                    int ch_h, ch_w;
+
+                    /* Selection operations can change many stars at once
+                     * (v/V, yy/dd clearing a selection, etc.).  Repaint the
+                     * current pane only; ordinary cursor motion retains the
+                     * two-row fast path. */
+                    getmaxyx(current_win, ch_h, ch_w);
+                    draw_current_pane(current_win, ch_w, ch_h);
+                    wnoutrefresh(current_win);
+                    draw_top_bar();
+                    wnoutrefresh(top_win);
+                    draw_status(status_win, COLS);
+                    wnoutrefresh(status_win);
+                    present_screen();
+                    details_pending = 1;
+                    details_warmup_pending = 1;
+                } else {
+                    draw_navigation_ui(old_cursor, old_top);
+                    details_pending = 1;
+                    details_warmup_pending = 1;
+                }
+            } else {
+                details_pending = 0;
+                details_warmup_pending = 0;
+                wtimeout(current_win, -1);
+                draw_ui();
+            }
+        }
+    }
+
+    if (stop_requested)
+        exit_reason = "signal";
+    dismiss_image_overlay();
+    cancel_directory_type_worker();
+    cancel_capacity_worker();
+    clear_directory_type_cache();
+    clear_directory_preview();
+    clear_image_preview();
+    if (curses_started) {
+        destroy_windows();
+        endwin();
+    }
+    if (paste_result_fd >= 0)
+        close(paste_result_fd);
+    close_volume_monitor();
+    network_forget_reads();
+    debug_log("exit reason=%s", exit_reason);
+    release_instance_lock();
+    if (debug_file)
+        fclose(debug_file);
+    reap_cancelled_workers();
+    free(cancelled_worker_pids);
+    return 0;
+}

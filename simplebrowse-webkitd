@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""Persistent WebKitGTK backend daemon for SimpleBrowse."""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import warnings
+
+VERSION = "4.0.0"
+HEADER = "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+DEFAULT_SETTLE_MS = 0
+DEFAULT_RESNAPSHOT_MS = 100
+DEFAULT_MAX_RESNAPSHOTS = 30
+
+# SimpleBrowse needs DOM snapshots, not accelerated presentation. Disabling
+# compositing avoids GL-context failures in terminal-launched sessions.
+os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+DOM_EXTRACT_SCRIPT = r"""
+(() => {
+  // Keep live DOM references out of the serialized HTML. IDs belong to one
+  // document lifetime; a cached snapshot cannot accidentally target a new page.
+  let bridge = window.__simplebrowseBridge;
+  if (!bridge || bridge.document !== document) {
+    bridge = window.__simplebrowseBridge = {
+      document, epoch: Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-'),
+      ids: new WeakMap(), nodes: new Map(), forms: [], next: 0,
+      lastMutation: performance.now(), observedRoots: new WeakSet()
+    };
+    bridge.observer = new MutationObserver(() => { bridge.lastMutation = performance.now(); });
+    bridge.observer.observe(document, {subtree: true, childList: true,
+                                      attributes: true, characterData: true});
+    bridge.observedRoots.add(document);
+  }
+  function observe(root) {
+    if (!bridge.observedRoots.has(root)) {
+      bridge.observer.observe(root, {subtree: true, childList: true,
+                                     attributes: true, characterData: true});
+      bridge.observedRoots.add(root);
+      bridge.lastMutation = performance.now();
+    }
+  }
+  for (const [key, node] of bridge.nodes) if (!node.isConnected) bridge.nodes.delete(key);
+  function nodeId(el) {
+    if (!bridge.ids.has(el)) bridge.ids.set(el, bridge.epoch + ':' + (++bridge.next));
+    const id = bridge.ids.get(el);
+    bridge.nodes.set(id, el);
+    return id;
+  }
+  function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+  function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>\"]/g,
+      ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[ch]));
+  }
+  function absolute(value, el) {
+    if (!value) return '';
+    try {
+      const url = new URL(value, el.baseURI || location.href);
+      return /^(https?|file):$/.test(url.protocol) ? url.href : '';
+    } catch (_) { return ''; }
+  }
+  function style(el) { return el.ownerDocument.defaultView.getComputedStyle(el); }
+  function visible(el) {
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+    const css = style(el);
+    return css.display !== 'none' && css.visibility !== 'hidden' &&
+      css.visibility !== 'collapse' && Number(css.opacity) !== 0;
+  }
+  function label(el) {
+    const root = el.getRootNode();
+    const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id => root.getElementById && root.getElementById(id))
+      .filter(Boolean).map(e => e.textContent).join(' ');
+    const associated = Array.from(el.labels || []).map(e => e.innerText || e.textContent).join(' ');
+    const imageText = Array.from(el.querySelectorAll('img[alt]')).map(e => e.alt).join(' ');
+    return clean(labelled || el.getAttribute('aria-label') || associated ||
+      el.innerText || imageText || el.getAttribute('alt') || el.getAttribute('title') ||
+      el.getAttribute('placeholder') ||
+      (/^(submit|button|reset)$/i.test(el.type || '') ? el.value : '') ||
+      el.getAttribute('name') || el.id || '');
+  }
+  function formAttrs(el) {
+    const form = el.form;
+    let index = -1;
+    if (form) {
+      index = bridge.forms.indexOf(form);
+      if (index < 0) { index = bridge.forms.length; bridge.forms.push(form); }
+    }
+    return ` data-simplebrowse-form-index="${index}"` +
+      ` data-simplebrowse-form-action="${escapeHtml(form ? form.action : location.href)}"` +
+      ` data-simplebrowse-form-method="${escapeHtml(form ? form.method : 'get')}"` +
+      ` data-simplebrowse-form-enctype="${escapeHtml(form ? form.enctype : 'application/x-www-form-urlencoded')}"`;
+  }
+  function control(el, out, forceButton = false) {
+    const tag = el.tagName.toLowerCase();
+    const disabled = el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true';
+    const type = forceButton ? 'button' : String(el.type || 'text').toLowerCase();
+    const name = el.name || '';
+    const value = 'value' in el ? el.value : '';
+    const title = label(el) || (forceButton ? 'Button' : type);
+    if (/(?:^|\s)(loading|searching|please wait)[.\s…]*$/i.test(title)) waitingText = true;
+    if (disabled) {
+      if (type !== 'hidden') out.push(`<p>[${escapeHtml(title)}: disabled]</p>`);
+      return;
+    }
+    const attrs = ` name="${escapeHtml(name)}" data-simplebrowse-control-id="${nodeId(el)}"` +
+      ` data-simplebrowse-label="${escapeHtml(title)}"` + formAttrs(el);
+    if (forceButton || tag === 'button') {
+      out.push(`<button type="${escapeHtml(type)}" value="${escapeHtml(value)}"${attrs}>${escapeHtml(title)}</button>`);
+    } else if (tag === 'textarea') {
+      // HTML consumes the first newline after <textarea>. Prefix one so a
+      // value that genuinely begins with a newline survives the C parser.
+      out.push(`<textarea${attrs}>\n${escapeHtml(value)}</textarea>`);
+    } else if (tag === 'select') {
+      out.push(`<select${attrs}>`);
+      for (const option of Array.from(el.options || [])) {
+        out.push(`<option value="${escapeHtml(option.value)}"${option.selected ? ' selected' : ''}>${escapeHtml(option.text)}</option>`);
+      }
+      out.push('</select>');
+    } else if (type === 'file') {
+      out.push(`<p>[${escapeHtml(title)}: file upload requires an external browser]</p>`);
+    } else {
+      const inputType = /^(hidden|text|search|password|email|url|number|checkbox|radio|submit|button)$/.test(type) ? type : 'text';
+      out.push(`<input type="${inputType}" value="${escapeHtml(value)}"${attrs}${el.checked ? ' checked' : ''}>`);
+    }
+  }
+  const discard = new Set(['HEAD','SCRIPT','STYLE','NOSCRIPT','TEMPLATE','SOURCE','TRACK','PORTAL']);
+  const seen = new Set();
+  let busy = false;
+  let emptyMain = false;
+  let waitingText = false;
+  let frameFallbacks = 0;
+  function emit(node, out, pre = false, depth = 0) {
+    if (depth > 128 || seen.has(node)) return;
+    seen.add(node);
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (/(?:^|\s)(loading|searching|please wait)[.\s…]*$/i.test(clean(node.nodeValue))) waitingText = true;
+      out.push(escapeHtml(pre ? node.nodeValue : node.nodeValue.replace(/\s+/g, ' ')));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node, tag = el.tagName.toLowerCase();
+    const hiddenInput = tag === 'input' && el.type === 'hidden';
+    if (discard.has(el.tagName) || (!hiddenInput && !visible(el))) return;
+    if (el.getAttribute('aria-busy') === 'true') busy = true;
+    if (tag.includes('-') && !el.ownerDocument.defaultView.customElements.get(tag)) busy = true;
+    if (tag === 'iframe') {
+      try {
+        if (el.contentDocument && el.contentDocument.body) {
+          observe(el.contentDocument);
+          out.push('<div>');
+          emit(el.contentDocument.body, out, false, depth + 1);
+          out.push('</div>');
+          return;
+        }
+      } catch (_) {}
+      const href = absolute(el.getAttribute('src'), el);
+      frameFallbacks++;
+      if (href) out.push(`<p><a href="${escapeHtml(href)}">${escapeHtml(label(el) || 'Embedded page')}</a></p>`);
+      return;
+    }
+    if (tag === 'a') {
+      const href = absolute(el.getAttribute('href'), el);
+      const text = clean(el.innerText) || label(el);
+      if (href && text && !(el.getAttribute('href') || '').startsWith('#'))
+        out.push(`<a href="${escapeHtml(href)}">${escapeHtml(text)}</a>`);
+      else if (text && (el.hasAttribute('href') || el.onclick || el.getAttribute('role') === 'link'))
+        control(el, out, true);
+      else if (text) out.push(escapeHtml(text));
+      return;
+    }
+    if (tag === 'img') {
+      const text = el.getAttribute('alt') || el.getAttribute('title');
+      if (text) out.push(`[Image: ${escapeHtml(text)}]`);
+      return;
+    }
+    if (tag === 'svg' || tag === 'canvas' || tag === 'object' || tag === 'embed') {
+      const text = label(el);
+      if (text) out.push(`[${escapeHtml(text)}]`);
+      return;
+    }
+    if (/^(input|textarea|select|button)$/.test(tag)) return control(el, out);
+    if (tag === 'summary' || /^(button|link|tab|menuitem)$/.test(el.getAttribute('role') || '') ||
+        (el.hasAttribute('onclick') && !el.querySelector('a,input,button,select,textarea'))) {
+      control(el, out, true);
+      return;
+    }
+    if (tag === 'br') { out.push('<br>'); return; }
+    if (tag === 'slot') {
+      const assigned = el.assignedNodes({flatten: true});
+      for (const child of assigned.length ? assigned : el.childNodes) emit(child, out, pre, depth + 1);
+      return;
+    }
+    const css = style(el);
+    const mainStart = out.length;
+    pre = pre || tag === 'pre' || /^(pre|pre-wrap|break-spaces)$/.test(css.whiteSpace);
+    let outTag = '';
+    if (/^h[1-6]$/.test(tag) || /^(p|li|ul|ol|pre|blockquote)$/.test(tag)) outTag = tag;
+    else if (pre) outTag = 'pre';
+    else if (/^(block|list-item|table|flex|grid)/.test(css.display) ||
+             /^(main|article|section|div|form|nav|header|footer|aside|dialog|details)$/.test(tag)) outTag = 'div';
+    if (outTag) out.push(`<${outTag}>`);
+    if (tag === 'details' && !el.open) {
+      const summary = Array.from(el.children).find(e => e.tagName === 'SUMMARY');
+      if (summary) emit(summary, out, pre, depth + 1);
+      else control(el, out, true);
+    } else {
+      const children = el.shadowRoot ? el.shadowRoot.childNodes : el.childNodes;
+      if (el.shadowRoot) observe(el.shadowRoot);
+      for (const child of children) emit(child, out, pre, depth + 1);
+    }
+    if (outTag) out.push(`</${outTag}>`);
+    if (tag === 'main' || el.getAttribute('role') === 'main') {
+      const region = out.slice(mainStart).join('');
+      const text = clean(region.replace(/<[^>]*>/g, ' '));
+      if ((!text && !/<(?:input|textarea|select|button)\b/.test(region)) ||
+          (text.length < 120 && /^(loading|please wait|just a moment)\b/i.test(text))) emptyMain = true;
+    }
+  }
+  const out = ['<!doctype html><html><head><title>', escapeHtml(document.title),
+    '</title></head><body><main data-simplebrowse-snapshot="visible" data-simplebrowse-snapshot-version="2">'];
+  emit(document.body || document.documentElement, out);
+  out.push('</main></body></html>');
+  const html = out.join('');
+  return JSON.stringify({url: location.href, title: document.title,
+    readyState: document.readyState, busy, emptyMain, mutationAge: performance.now() - bridge.lastMutation,
+    waitingText, contentChars: clean(html.replace(/<[^>]*>/g, ' ')).length,
+    frameFallbacks, html});
+})()
+"""
+
+FORM_SUBMIT_SCRIPT = r"""
+(() => {
+  const payload = JSON.parse(%s);
+  const bridge = window.__simplebrowseBridge;
+  const error = message => 'SIMPLEBROWSE_ERROR ' + message;
+  if (!bridge || bridge.document !== document) return error('Stale page; reload before activating controls');
+  const target = bridge.nodes.get(payload.target_id);
+  if (!target || !target.isConnected) return error('Stale control; reload before activating it');
+  if (target.matches(':disabled') || target.getAttribute('aria-disabled') === 'true')
+    return error('Control is disabled');
+  // Validate the complete payload before editing anything. Names are not
+  // identities: duplicate names, unnamed controls, and external form owners
+  // all occur in ordinary HTML.
+  const controls = [];
+  for (const control of payload.controls || []) {
+    if (!control.dom_id) continue;
+    const el = bridge.nodes.get(control.dom_id);
+    if (!el || !el.isConnected) return error('Stale form field; reload before submitting');
+    controls.push([el, control]);
+  }
+  function setNative(el, property, value) {
+    const win = el.ownerDocument.defaultView;
+    const prototype = el.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype :
+      el.tagName === 'SELECT' ? win.HTMLSelectElement.prototype : win.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+    if (descriptor && descriptor.set) descriptor.set.call(el, value);
+    else el[property] = value;
+  }
+  for (const [el, control] of controls) {
+    const type = String(el.type || '').toLowerCase();
+    if (el.matches(':disabled') || el.readOnly || /^(hidden|submit|button|reset|file)$/.test(type) ||
+        !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) continue;
+    let changed = false;
+    if (type === 'checkbox' || type === 'radio') {
+      if (el === target && payload.action === 'change') continue;
+      if (el.checked !== !!control.checked) {
+        setNative(el, 'checked', !!control.checked); changed = true;
+      }
+    } else if (el.value !== String(control.value == null ? '' : control.value)) {
+      setNative(el, 'value', String(control.value == null ? '' : control.value)); changed = true;
+    }
+    if (changed) {
+      const win = el.ownerDocument.defaultView;
+      el.dispatchEvent(new win.Event('input', {bubbles: true, composed: true}));
+      el.dispatchEvent(new win.Event('change', {bubbles: true}));
+    }
+  }
+  target.focus();
+  const type = String(target.type || '').toLowerCase();
+  if (payload.action === 'change') {
+    const value = controls.find(([el]) => el === target);
+    if (/^(checkbox|radio)$/.test(type) && value && target.checked !== !!value[1].checked)
+      target.click();
+    return 'changed';
+  }
+  if (payload.action === 'click' || /^(submit|button|reset|image)$/.test(type)) {
+    if (target.tagName === 'DETAILS') target.open = !target.open;
+    else target.click();
+    return 'activated';
+  }
+  const form = target.form;
+  if (form) {
+    const submitter = Array.from(form.elements).find(el =>
+      /^(submit|image)$/.test(el.type || '') && !el.matches(':disabled'));
+    if (submitter) submitter.click();
+    else if (form.requestSubmit) form.requestSubmit();
+    else if (form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true})))
+      HTMLFormElement.prototype.submit.call(form);
+    return 'submitted';
+  }
+  const win = target.ownerDocument.defaultView;
+  for (const type of ['keydown', 'keypress', 'keyup'])
+    target.dispatchEvent(new win.KeyboardEvent(type, {key: 'Enter', code: 'Enter',
+      keyCode: 13, which: 13, bubbles: true, cancelable: true}));
+  return 'activated';
+})()
+"""
+
+
+def fail(message, code=1):
+    print(f"simplebrowse-webkitd: {message}", file=sys.stderr)
+    return code
+
+
+def load_gi():
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import GLib, Gtk, WebKit2
+
+        return GLib, Gtk, WebKit2
+    except Exception as exc:
+        raise RuntimeError(
+            "missing WebKitGTK Python bindings "
+            "(need python3-gi and WebKit2GTK 4.1 introspection)"
+        ) from exc
+
+
+def read_payload(stdin, size):
+    data = stdin.read(size)
+    if len(data) != size:
+        raise EOFError("truncated command payload")
+    trail = stdin.read(1)
+    if trail != b"\n":
+        raise ValueError("malformed command payload")
+    return data.decode("utf-8", "replace")
+
+
+def emit_response(status, url="", title="", html="", error="", code=0):
+    url_b = (url or "").encode("utf-8", "replace")
+    title_b = (title or "").encode("utf-8", "replace")
+    error_b = (error or "").encode("utf-8", "replace")
+    html_b = (html or "").encode("utf-8", "replace")
+    out = sys.stdout.buffer
+    out.write(f"{HEADER}\n".encode("ascii"))
+    out.write(f"STATUS {status}\n".encode("ascii"))
+    out.write(f"CODE {code}\n".encode("ascii"))
+    out.write(f"URL_LENGTH {len(url_b)}\n".encode("ascii"))
+    out.write(f"TITLE_LENGTH {len(title_b)}\n".encode("ascii"))
+    out.write(f"ERROR_LENGTH {len(error_b)}\n".encode("ascii"))
+    out.write(f"HTML_LENGTH {len(html_b)}\n\n".encode("ascii"))
+    out.write(url_b)
+    out.write(title_b)
+    out.write(error_b)
+    out.write(html_b)
+    out.flush()
+
+
+def set_if_available(obj, name, value):
+    setter = getattr(obj, name, None)
+    if not setter:
+        return
+    try:
+        setter(value)
+    except Exception as exc:
+        print(f"simplebrowse-webkitd: {name} unavailable: {exc}", file=sys.stderr)
+
+
+class BrowserDaemon:
+    def __init__(self, GLib, Gtk, WebKit2, settle_ms, timeout_ms,
+                 resnapshot_ms, max_resnapshots):
+        self.GLib = GLib
+        self.Gtk = Gtk
+        self.WebKit2 = WebKit2
+        self.settle_ms = max(settle_ms, 0)
+        self.timeout_ms = max(timeout_ms, 1000)
+        self.resnapshot_ms = max(resnapshot_ms, 50)
+        self.max_resnapshots = max(max_resnapshots, 0)
+        self.command_id = 0
+        self.state = None
+        self.loop = None
+        self.resources = set()
+
+        context = self._create_context()
+        self.view = WebKit2.WebView.new_with_context(context)
+        settings = self.view.get_settings()
+        self._configure_settings(settings)
+        user_agent = os.environ.get("SIMPLEBROWSE_WEBKIT_UA")
+        if user_agent and hasattr(settings, "set_user_agent"):
+            settings.set_user_agent(user_agent)
+
+        self.window = Gtk.OffscreenWindow()
+        self.window.set_default_size(1280, 900)
+        self.window.add(self.view)
+        self.window.show_all()
+
+        self.view.connect("load-changed", self.on_load_changed)
+        self.view.connect("load-failed", self.on_load_failed)
+        self.view.connect("web-process-terminated", self.on_process_terminated)
+        self.view.connect("resource-load-started", self.on_resource_started)
+
+    def _configure_settings(self, settings):
+        set_if_available(settings, "set_enable_javascript", True)
+        set_if_available(settings, "set_enable_plugins", False)
+        set_if_available(settings, "set_auto_load_images", False)
+        set_if_available(settings, "set_load_icons_ignoring_image_load_setting", False)
+        set_if_available(settings, "set_enable_media", False)
+        set_if_available(settings, "set_enable_mediasource", False)
+        set_if_available(settings, "set_enable_media_stream", False)
+        set_if_available(settings, "set_enable_encrypted_media", False)
+        set_if_available(settings, "set_enable_webgl", False)
+        set_if_available(settings, "set_enable_2d_canvas_acceleration", False)
+        set_if_available(settings, "set_enable_accelerated_2d_canvas", False)
+        set_if_available(settings, "set_enable_offline_web_application_cache", False)
+        set_if_available(settings, "set_enable_write_console_messages_to_stdout", False)
+        set_if_available(settings, "set_javascript_can_open_windows_automatically", False)
+        set_if_available(settings, "set_media_playback_requires_user_gesture", True)
+
+    def _state_dir(self):
+        data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+        return os.environ.get(
+            "SIMPLEBROWSE_WEBKIT_STATE_DIR",
+            os.path.join(data_home, "simplebrowse", "webkit"),
+        )
+
+    def _create_context(self):
+        state_dir = self._state_dir()
+        cache_dir = os.path.join(state_dir, "cache")
+        os.makedirs(state_dir, exist_ok=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            manager = self.WebKit2.WebsiteDataManager(
+                base_data_directory=state_dir,
+                base_cache_directory=cache_dir,
+            )
+            context = self.WebKit2.WebContext.new_with_website_data_manager(manager)
+        except Exception as exc:
+            print(f"simplebrowse-webkitd: persistent data manager unavailable: {exc}",
+                  file=sys.stderr)
+            context = self.WebKit2.WebContext.get_default()
+        self._configure_context(context, state_dir)
+        return context
+
+    def _configure_context(self, context, state_dir):
+        os.makedirs(state_dir, exist_ok=True)
+        cookie_path = os.path.join(state_dir, "cookies.sqlite")
+        try:
+            manager = context.get_cookie_manager()
+            manager.set_persistent_storage(
+                cookie_path, self.WebKit2.CookiePersistentStorage.SQLITE
+            )
+        except Exception as exc:
+            print(f"simplebrowse-webkitd: cookie persistence unavailable: {exc}", file=sys.stderr)
+
+    def command_matches(self, command_id):
+        return (
+            self.state is not None and
+            self.state.get("id") == command_id and
+            not self.state.get("done")
+        )
+
+    def finish(self, command_id, status, url="", title="", html="", error="", code=0):
+        if not self.command_matches(command_id):
+            return False
+        self.state.update({
+            "done": True,
+            "response": {
+                "status": status,
+                "url": url or self.view.get_uri() or self.state.get("url", ""),
+                "title": title or self.view.get_title() or "",
+                "html": html or "",
+                "error": error or "",
+                "code": code,
+            },
+        })
+        if self.loop:
+            self.loop.quit()
+        return False
+
+    def evaluate_now(self, command_id):
+        if not self.command_matches(command_id):
+            return False
+        if self.state.get("eval_started"):
+            return False
+        if self.state["kind"] == "submit" and not self.state.get("action_done"):
+            return False
+        self.state["eval_started"] = True
+        token = (command_id, self.state["navigation"])
+        self.view.run_javascript(DOM_EXTRACT_SCRIPT, None, self.js_finished, token)
+        return False
+
+    def probe_dom_ready(self, command_id):
+        if not self.command_matches(command_id):
+            return False
+        if self.state.get("load_finished") or self.state.get("eval_started"):
+            return False
+        if self.state.get("ready_probe_pending"):
+            return False
+        self.state["ready_probe_pending"] = True
+        self.view.run_javascript("document.readyState", None,
+                                 self.dom_ready_probed, command_id)
+        return False
+
+    def dom_ready_probed(self, webview, result, command_id):
+        if not self.command_matches(command_id):
+            return False
+        self.state["ready_probe_pending"] = False
+        if self.state.get("load_finished"):
+            return False
+        ready_state = ""
+        try:
+            js_result = webview.run_javascript_finish(result)
+            ready_state = str(js_result.get_js_value().to_string())
+        except Exception:
+            pass
+        if ready_state in ("interactive", "complete"):
+            return self.evaluate_now(command_id)
+        self.GLib.timeout_add(self.resnapshot_ms, self.probe_dom_ready,
+                              command_id)
+        return False
+
+    def js_finished(self, webview, result, token):
+        command_id, navigation = token
+        if not self.command_matches(command_id):
+            return False
+        if navigation != self.state["navigation"]:
+            return False
+        self.state["eval_started"] = False
+        try:
+            js_result = webview.run_javascript_finish(result)
+            value = js_result.get_js_value()
+            data = json.loads(value.to_string())
+            url = data.get("url") or webview.get_uri() or self.state.get("url", "")
+            title = data.get("title") or webview.get_title() or ""
+            ready_state = data.get("readyState") or ""
+            html = data.get("html") or ""
+            if not html.strip():
+                return self.finish(command_id, "ERROR", url=url, title=title,
+                                   error="post-JavaScript DOM was empty", code=0)
+            early = not self.state.get("load_finished")
+            # DOM-ready does not mean an application is ready. Wait for a
+            # quiet visible DOM, honor aria-busy, and allow asynchronous click
+            # handlers to replace an already substantial page. All waits are
+            # bounded; pages with perpetual animations still produce output.
+            action_age = time.monotonic() - self.state.get("action_time", 0)
+            action_wait = max(self.settle_ms, 1000) / 1000
+            unsettled = (bool(self.resources) or data.get("busy", False) or data.get("emptyMain", False) or
+                         data.get("mutationAge", 10000) < max(self.settle_ms, 200) or
+                         (self.state["kind"] == "submit" and action_age < action_wait))
+            thin = self.snapshot_is_too_thin(html, title, ready_state, early)
+            if os.environ.get("SIMPLEBROWSE_WEBKIT_TRACE"):
+                print(json.dumps({"event": "snapshot", "url": url,
+                    "readyState": ready_state, "resources": len(self.resources),
+                    "retries": self.state["extract_retries"], "thin": bool(thin),
+                    **{key: data.get(key) for key in ("busy", "emptyMain", "waitingText", "mutationAge")}}),
+                    file=sys.stderr, flush=True)
+            # A search page can populate a large filter sidebar before its
+            # result request completes. Character/link counts cannot certify
+            # readiness. Some applications initially show "0 results" with
+            # no loading indicator at all. Pending requests and explicit
+            # loading indicators therefore use the command's hard deadline.
+            pending_content = (bool(self.resources) or data.get("waitingText", False) or
+                               data.get("busy", False))
+            unsettled = unsettled or pending_content
+            if (unsettled or thin) and not self.state.get("deadline_snapshot"):
+                retries = int(self.state.get("extract_retries") or 0)
+                if retries < self.max_resnapshots or data.get("emptyMain", False) or pending_content:
+                    self.state["extract_retries"] = retries + 1
+                    self.state["eval_started"] = False
+                    self.GLib.timeout_add(self.resnapshot_ms, self.evaluate_now,
+                                          command_id)
+                    return False
+                if early and thin:
+                    # The document still is not useful, but subresources are
+                    # loading. Let FINISHED trigger one definitive snapshot
+                    # instead of returning an application shell.
+                    self.state["eval_started"] = False
+                    return False
+            return self.finish(command_id, "OK", url=url, title=title, html=html,
+                               code=self.current_status_code())
+        except Exception as exc:
+            return self.finish(command_id, "ERROR", error=f"DOM extraction failed: {exc}", code=0)
+
+    def snapshot_is_too_thin(self, html, title, ready_state="", early=False):
+        if "data-simplebrowse-snapshot" not in html:
+            return False
+        plain = re.sub(r"<[^>]+>", " ", html or "")
+        lower_plain = plain.lower()
+        meaningful = sum(1 for ch in plain if ch.isalnum())
+        title_chars = sum(1 for ch in (title or "") if ch.isalnum())
+        links = html.lower().count("<a ")
+        controls = len(re.findall(r"<(?:input|textarea|select|button)\b", html, re.I))
+        if early:
+            # COMMITTED lets us inspect DOM-ready content during loading;
+            # resource and readiness checks still decide when to return it.
+            if ready_state == "loading":
+                return True
+            if meaningful < 600:
+                return True
+            if links < 3 and meaningful < 1200:
+                return True
+            if (meaningful < 2000 and
+                    re.search(r"\b(loading|please wait|just a moment)\b", lower_plain)):
+                return True
+        if links != 0 or controls != 0:
+            return False
+        if meaningful <= max(16, title_chars + 8):
+            return True
+        return (
+            meaningful <= max(80, title_chars + 40) and
+            re.search(r"\b(loading|please wait|just a moment)\b", lower_plain)
+        )
+
+    def schedule_evaluate(self, command_id):
+        self.GLib.timeout_add(self.settle_ms, self.evaluate_now, command_id)
+
+    def current_status_code(self):
+        try:
+            resource = self.view.get_main_resource()
+            response = resource.get_response() if resource else None
+            code = int(response.get_status_code()) if response else 0
+            return code if code > 0 else 200
+        except Exception:
+            return 200
+
+    def submit_now(self, command_id):
+        if not self.command_matches(command_id):
+            return False
+        if self.state.get("submit_started"):
+            return False
+        self.state["submit_started"] = True
+        script = FORM_SUBMIT_SCRIPT % json.dumps(self.state.get("payload") or "{}")
+        self.view.run_javascript(script, None, self.submit_finished, command_id)
+        return False
+
+    def submit_finished(self, webview, result, command_id):
+        if not self.command_matches(command_id):
+            return False
+        try:
+            js_result = webview.run_javascript_finish(result)
+            value = js_result.get_js_value()
+            text = str(value.to_string())
+            if text.startswith("SIMPLEBROWSE_ERROR "):
+                return self.finish(command_id, "ERROR", error=text[19:], code=0)
+            if text.startswith("SIMPLEBROWSE_NAVIGATE "):
+                target = text[len("SIMPLEBROWSE_NAVIGATE "):].strip()
+                webview.load_uri(target)
+                self.state["submit_started"] = True
+                return False
+        except Exception as exc:
+            return self.finish(command_id, "ERROR", error=f"action failed: {exc}", code=0)
+        self.state["action_done"] = True
+        self.state["action_time"] = time.monotonic()
+        self.state["eval_started"] = False
+        # A script-handled form can update the existing DOM asynchronously
+        # without producing another load event. Give that update one short
+        # retry interval; ordinary page loads remain delay-free.
+        self.GLib.timeout_add(max(self.settle_ms, self.resnapshot_ms),
+                              self.evaluate_now, command_id)
+        return False
+
+    def on_load_changed(self, _webview, event):
+        if self.state is None or self.state.get("done"):
+            return
+        command_id = self.state["id"]
+        if event == self.WebKit2.LoadEvent.STARTED:
+            self.state["navigation"] += 1
+            self.state["load_finished"] = False
+            self.state["eval_started"] = False
+        if (event == self.WebKit2.LoadEvent.COMMITTED and
+                self.state["kind"] == "load"):
+            # Inspect DOM-ready content and let the readiness checks retry
+            # or defer to FINISHED while the application is still loading.
+            self.GLib.timeout_add(self.resnapshot_ms, self.probe_dom_ready,
+                                  command_id)
+        if event == self.WebKit2.LoadEvent.FINISHED:
+            self.state["load_finished"] = True
+            if self.state["kind"] == "load":
+                self.schedule_evaluate(command_id)
+            elif self.state["kind"] == "submit":
+                if not self.state.get("submit_started"):
+                    self.GLib.timeout_add(self.settle_ms, self.submit_now, command_id)
+                else:
+                    self.schedule_evaluate(command_id)
+
+    def on_load_failed(self, _webview, _event, uri, error):
+        if self.state is None or self.state.get("done"):
+            return False
+        if error.matches(self.WebKit2.network_error_quark(), self.WebKit2.NetworkError.CANCELLED):
+            return False
+        return self.finish(
+            self.state["id"], "ERROR", url=uri or self.state.get("url", ""),
+            error=f"load failed: {error.message}", code=0,
+        )
+
+    def on_process_terminated(self, _webview, reason):
+        if self.state is not None and not self.state.get("done"):
+            self.finish(self.state["id"], "ERROR", error=f"WebKit process terminated: {reason}")
+
+    def on_resource_started(self, _webview, resource, _request):
+        self.resources.add(resource)
+        resource.connect("finished", lambda r: self.resources.discard(r))
+
+    def on_timeout(self, command_id):
+        if not self.command_matches(command_id):
+            return False
+        if not self.state.get("eval_started"):
+            # Force the timeout snapshot to be definitive even when the page
+            # never emits FINISHED; otherwise an early thin-page deferral
+            # could wait forever after this one-shot timer has fired.
+            self.state["load_finished"] = True
+            self.state["deadline_snapshot"] = True
+            if self.state["kind"] == "submit" and not self.state.get("action_done"):
+                return self.finish(command_id, "ERROR", error="timed out waiting for WebKit action", code=0)
+            self.evaluate_now(command_id)
+            self.GLib.timeout_add(1000, self.on_timeout, command_id)
+            return False
+        return self.finish(command_id, "ERROR", error="timed out waiting for WebKit page", code=0)
+
+    def begin_command(self, kind, url, payload=None):
+        self.command_id += 1
+        command_id = self.command_id
+        self.state = {
+            "id": command_id,
+            "kind": kind,
+            "url": url,
+            "payload": payload,
+            "done": False,
+            "eval_started": False,
+            "submit_started": False,
+            "extract_retries": 0,
+            "load_finished": False,
+            "ready_probe_pending": False,
+            "navigation": 0,
+            "action_done": False,
+            "action_time": 0,
+            "deadline_snapshot": False,
+            "response": None,
+        }
+        self.loop = self.GLib.MainLoop()
+        self.GLib.timeout_add(self.timeout_ms, self.on_timeout, command_id)
+        return command_id
+
+    def load(self, url):
+        self.begin_command("load", url)
+        self.view.load_uri(url)
+        self.loop.run()
+        return self.state["response"]
+
+    def submit(self, url, payload):
+        command_id = self.begin_command("submit", url, payload)
+        current = self.view.get_uri() or ""
+        if current == url:
+            self.state["load_finished"] = not self.view.is_loading()
+            self.GLib.idle_add(self.submit_now, command_id)
+        else:
+            self.view.load_uri(url)
+        self.loop.run()
+        return self.state["response"]
+
+    def close(self):
+        self.window.destroy()
+
+
+def serve(stdin, daemon):
+    while True:
+        line = stdin.readline()
+        if not line:
+            break
+        line = line.decode("ascii", "replace").strip()
+        if not line:
+            continue
+        if line == "QUIT":
+            break
+
+        try:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "LOAD":
+                url = read_payload(stdin, int(parts[1]))
+                response = daemon.load(url)
+            elif len(parts) == 3 and parts[0] == "SUBMIT":
+                url = read_payload(stdin, int(parts[1]))
+                payload = read_payload(stdin, int(parts[2]))
+                response = daemon.submit(url, payload)
+            else:
+                emit_response("ERROR", error=f"unknown command: {line}", code=2)
+                continue
+            emit_response(**response)
+        except Exception as exc:
+            emit_response("ERROR", error=str(exc), code=1)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Persistent WebKitGTK backend for SimpleBrowse")
+    parser.add_argument("--version", action="version", version=f"simplebrowse-webkitd {VERSION}")
+    parser.add_argument("--settle-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", str(DEFAULT_SETTLE_MS))))
+    parser.add_argument("--timeout-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_TIMEOUT_MS", "20000")))
+    parser.add_argument("--resnapshot-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_RESNAPSHOT_MS", str(DEFAULT_RESNAPSHOT_MS))))
+    parser.add_argument("--max-resnapshots", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_MAX_RESNAPSHOTS", str(DEFAULT_MAX_RESNAPSHOTS))))
+    args = parser.parse_args(argv)
+
+    try:
+        GLib, Gtk, WebKit2 = load_gi()
+    except RuntimeError as exc:
+        return fail(str(exc), 127)
+
+    ok, _ = Gtk.init_check([])
+    if not ok:
+        return fail("GTK could not open a display; WebKit backend needs a graphical session", 2)
+
+    daemon = BrowserDaemon(GLib, Gtk, WebKit2, args.settle_ms, args.timeout_ms,
+                           args.resnapshot_ms, args.max_resnapshots)
+    try:
+        serve(sys.stdin.buffer, daemon)
+    finally:
+        daemon.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

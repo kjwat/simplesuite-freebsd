@@ -1,0 +1,60 @@
+#!/bin/sh
+
+# Canonical user-facing SimpleSuite program and alias manifest.
+# Book opens SimpleBook; keep Bash's read builtin available.
+simplesuite_program_aliases() {
+    os=${1:-$(uname -s 2>/dev/null || true)}
+    install_simpleserve=${2:-0}
+
+    cat <<'EOF'
+browse:simplebrowse
+burn:simpleburn
+cal:simplecal
+change:simplechange
+clock:simpleclock
+files:simplefiles
+flac:simpleflac
+game:simplegame
+mail:simplemail
+news:simplenews
+note:simplenote
+book:simplebook
+pod:simplepod
+radio:simpleradio
+save:simplesave
+search:simplesearch
+stats:simplestats
+suite-uninstall:simplesuite-uninstall
+ver:simplever
+vis:simplevis
+words:simplewords
+EOF
+    case $os in
+        Linux) printf '%s\n' 'net:simplenet' 'blue:simpleblue' 'vol:simplevol' ;;
+        FreeBSD) printf '%s\n' 'net:simplenet' 'blue:simpleblue' 'vol:simplevol' ;;
+    esac
+    if [ "$install_simpleserve" = 1 ]; then
+        printf '%s\n' 'serve:simpleserve'
+    fi
+}
+
+simplesuite_programs() {
+    simplesuite_program_aliases "$1" "$2" |
+        while IFS=: read -r short full; do
+            [ -n "$short" ] && [ -n "$full" ] || continue
+            [ "$full" = simplesuite-uninstall ] || printf '%s\n' "$full"
+        done
+    # Internal converter: built, installed and verified without a short alias.
+    printf '%s\n' simplebook-mobi
+    if [ "${2:-0}" = 1 ]; then
+        printf '%s\n' simpleserved
+    fi
+}
+
+# Standalone desktop applications; keep these out of terminal-only builds.
+simplesuite_desktop_aliases() {
+    printf '%s\n' 'term:simpleterm'
+    case ${1:-$(uname -s)} in
+        Linux|FreeBSD) printf '%s\n' 'play:simpleplay' 'pdf:simplepdf' ;;
+    esac
+}

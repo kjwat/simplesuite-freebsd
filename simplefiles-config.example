@@ -1,0 +1,46 @@
+# SimpleFiles configuration
+# Copy to:
+# ~/.config/simplefiles/config
+
+# Open text files in a terminal editor.
+# Values: terminal, gui
+OPEN_MODE=terminal
+
+# Editor used when opening text files.
+EDITOR_COMMAND=simplewords
+
+# Show preview pane.
+PREVIEW=true
+
+# Maximum preview rows (text and supported terminal-graphics images).
+PREVIEW_LINES=80
+
+# Ask before moving files to trash.
+CONFIRM_DELETE=true
+
+# Leave unset to use the freedesktop trash on each source filesystem;
+# :emptytrash then clears the merged home and mounted-volume trash view.
+# Set a path to use and empty only that custom trash location.
+# TRASH_DIR=~/.local/share/simplefiles/trash
+
+# Additional text file extensions.
+# TEXT_EXTENSIONS=.txt,.md,.c,.h,.cpp,.py,.sh,.conf,.ini,.log
+
+# Custom file associations.
+OPEN_.pdf=simplepdf
+OPEN_.epub=simplebook
+OPEN_.mobi=simplebook
+OPEN_.azw=simplebook
+OPEN_.azw3=simplebook
+OPEN_.flac=simpleflac
+OPEN_.mp3=simpleflac
+OPEN_.ogg=simpleflac
+OPEN_.wav=simpleflac
+OPEN_.m4a=simpleflac
+OPEN_.aac=simpleflac
+OPEN_.opus=simpleflac
+OPEN_.ape=simpleflac
+OPEN_.cue=simpleflac
+OPEN_.m3u=simpleradio
+OPEN_.m3u8=simpleradio
+OPEN_.pls=simpleradio

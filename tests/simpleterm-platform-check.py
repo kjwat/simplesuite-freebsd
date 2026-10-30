@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Exercise the native binary and staged install without needing a display."""
+import os
+from pathlib import Path
+import plistlib
+import platform
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def run(*arguments, **kwargs):
+    return subprocess.run(arguments, check=True, text=True, **kwargs)
+
+
+def check_cli(binary):
+    assert run(str(binary), "--version", capture_output=True).stdout.startswith("simpleterm ")
+    assert "Ctrl+Shift+C/V" in run(str(binary), "--help", capture_output=True).stdout
+    for arguments in (("--zoom", "nan"), ("--zoom", "0"), ("--geometry", "80x"),
+                      ("--geometry", "0x24"), ("--bad-option",), ("--tab",), ("--",), ("-e",)):
+        result = subprocess.run([str(binary), *arguments], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 2, (arguments, result)
+    print("OK CLI validation without a display", flush=True)
+
+
+def check_staging(binary, stage):
+    environment = dict(os.environ, DESTDIR=str(stage), SIMPLETERM_BUILD_DIR=str(binary.parent))
+    run(str(ROOT / "install-simpleterm.sh"), "--no-deps", env=environment, timeout=60)
+    installed = stage / "usr/local/bin/simpleterm"
+    assert installed.read_bytes() == binary.read_bytes()
+    assert installed.stat().st_mode & 0o777 == 0o755
+    assert (stage / "usr/local/share/simplesuite/simpleterm/SIMPLETERM.md").is_file()
+    assert (stage / "usr/local/share/simplesuite/simpleterm/bashrc").read_bytes() == \
+        (ROOT / "assets/simpleterm-bashrc").read_bytes()
+    assert (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").read_bytes() == \
+        (ROOT / "assets/simpleterm.png").read_bytes()
+    application = stage / "Applications/Simpleterm.app"
+    bundle = application
+    if platform.system() == "Darwin":
+        assert application.is_dir() and not application.is_symlink()
+        info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+        assert info["CFBundleIdentifier"] == "org.simplesuite.Simpleterm"
+        assert info["LSApplicationCategoryType"] == "public.app-category.utilities"
+        assert (bundle / "Contents/Resources" / info["CFBundleIconFile"]).read_bytes() == \
+            (binary.parent / "simpleterm.icns").read_bytes()
+        assert (bundle / "Contents/MacOS" / info["CFBundleExecutable"]).stat().st_mode & 0o777 == 0o755
+    else:
+        desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop"
+        assert "Icon=/usr/local/share/simplesuite/simpleterm/simpleterm.png\n" in desktop.read_text()
+        compatibility = stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop"
+        assert compatibility.is_symlink() and compatibility.resolve() == desktop
+    unrelated = stage / "usr/local/bin/unrelated"
+    unrelated.write_text("keep me")
+    run(str(ROOT / "install-simpleterm.sh"), "--uninstall", env=environment, timeout=10)
+    assert not installed.exists()
+    assert not application.is_symlink()
+    assert not bundle.exists()
+    assert not (stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink()
+    assert not (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists()
+    assert not (stage / "usr/local/share/simplesuite/simpleterm/bashrc").exists()
+    assert unrelated.read_text() == "keep me"
+    print("OK native staged install, launcher, verification, and uninstall", flush=True)
+
+
+if __name__ == "__main__":
+    binary = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "build/simpleterm").resolve()
+    check_cli(binary)
+    with tempfile.TemporaryDirectory(prefix="simpleterm-native-") as temporary:
+        check_staging(binary, Path(temporary) / "stage")

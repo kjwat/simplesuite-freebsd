@@ -1,0 +1,500 @@
+#define main simplebook_program_main
+#include "../simplebook.c"
+#undef main
+
+#include <assert.h>
+#include <dirent.h>
+
+static void check_mobi_conversion(void)
+{
+    char directory[] = "/tmp/simplebook-mobi-check.XXXXXX";
+    char source[PATH_MAX], output[PATH_MAX], tool[PATH_MAX];
+    char cached_text[PATH_MAX], cached_epub[PATH_MAX], changed_text[PATH_MAX];
+    char cache_dir[PATH_MAX];
+    const char *old_path_value = getenv("PATH");
+    const char *old_cache_value = getenv("XDG_CACHE_HOME");
+    char *old_path = old_path_value ? strdup(old_path_value) : NULL;
+    char *old_cache = old_cache_value ? strdup(old_cache_value) : NULL;
+    int cache_hit;
+
+    assert(mkdtemp(directory));
+    snprintf(source, sizeof source, "%s/reader's $(false).MOBI", directory);
+    snprintf(output, sizeof output, "%s/converted.epub", directory);
+    snprintf(tool, sizeof tool, "%s/simplebook-mobi", directory);
+    snprintf(cache_dir, sizeof cache_dir, "%s/simplebook", directory);
+    FILE *fp = fopen(source, "w");
+    assert(fp);
+    assert(fputs("Book contents\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    fp = fopen(tool, "w");
+    assert(fp);
+    assert(fputs("#!/bin/sh\n"
+                 "[ \"$#\" -eq 4 ] && [ \"$1\" = -e ] && [ \"$2\" = -o ] || exit 19\n"
+                 "while IFS= read -r line; do printf '%s\\n' \"$line\"; done "
+                 "<\"$4\" >\"$3/book.epub\"\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(chmod(tool, 0700) == 0);
+    assert(setenv("PATH", directory, 1) == 0);
+
+    assert(is_mobi_file(source));
+    assert(is_mobi_file("BOOK.AZW"));
+    assert(is_mobi_file("book.azw3"));
+    assert(!is_mobi_file("book.epub"));
+    assert(convert_mobi_to_epub(source, output) == 0);
+    struct stat st;
+    assert(stat(output, &st) == 0 && (st.st_mode & 0777) == 0600);
+    char text[64];
+    fp = fopen(output, "r");
+    assert(fp && fgets(text, sizeof text, fp));
+    assert(!strcmp(text, "Book contents\n"));
+    assert(fclose(fp) == 0);
+
+    /* Converter failures never replace a previously complete cache entry. */
+    fp = fopen(tool, "w");
+    assert(fp && fputs("#!/bin/sh\nexit 19\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(convert_mobi_to_epub(source, output) == 19);
+    fp = fopen(tool, "w");
+    assert(fp && fputs("#!/bin/sh\nexit 0\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(convert_mobi_to_epub(source, output) == -1);
+    assert(unlink(tool) == 0);
+    assert(convert_mobi_to_epub(source, output) == 127);
+    fp = fopen(output, "r");
+    assert(fp && fgets(text, sizeof text, fp));
+    assert(!strcmp(text, "Book contents\n"));
+    assert(fclose(fp) == 0);
+
+    /* Text and converted EPUB caches share the original file's identity. */
+    assert(setenv("XDG_CACHE_HOME", directory, 1) == 0);
+    mobi_mode = epub_mode = 1;
+    assert(cache_document_path(source, "txt", cached_text, sizeof cached_text,
+                               &cache_hit) == 0 && !cache_hit);
+    assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub,
+                               &cache_hit) == 0 && !cache_hit);
+    size_t stem = (size_t)(strrchr(cached_text, '.') - cached_text);
+    assert(!strncmp(cached_text, cached_epub, stem));
+
+    /* The rename preserves a valid legacy cache and never replaces new data. */
+    char legacy_dir[PATH_MAX], legacy_text[PATH_MAX], legacy_epub[PATH_MAX];
+    const char *legacy_names[] = { "simplepdf", "simpleread" };
+    for (size_t i = 0; i < sizeof legacy_names / sizeof legacy_names[0]; i++) {
+        snprintf(legacy_dir, sizeof legacy_dir, "%s/%s", directory, legacy_names[i]);
+        assert(mkdir(legacy_dir, 0700) == 0);
+        assert(strlen(legacy_dir) + strlen(strrchr(cached_text, '/')) < sizeof legacy_text);
+        strcpy(legacy_text, legacy_dir); strcat(legacy_text, strrchr(cached_text, '/'));
+        strcpy(legacy_epub, legacy_dir); strcat(legacy_epub, strrchr(cached_epub, '/'));
+        fp = fopen(legacy_text, "w"); assert(fp);
+        assert(fputs("legacy reading text\n", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
+        assert(access(legacy_text, R_OK) == 0 && usable_reader_cache(cached_text, "txt"));
+        fp = fopen(cached_text, "w"); assert(fp);
+        assert(fputs("newer reading text\n", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
+        fp = fopen(cached_text, "r"); assert(fp && fgets(text, sizeof text, fp));
+        assert(!strcmp(text, "newer reading text\n") && fclose(fp) == 0);
+        fp = fopen(legacy_epub, "w"); assert(fp);
+        assert(fputs("not an EPUB", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && !cache_hit);
+        fp = fopen(legacy_epub, "w"); assert(fp);
+        assert(fwrite("PK\003\004valid-cache", 1, 15, fp) == 15 && fclose(fp) == 0);
+        assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && cache_hit);
+        assert(unlink(cached_text) == 0 && unlink(cached_epub) == 0);
+        assert(unlink(legacy_text) == 0 && unlink(legacy_epub) == 0 && rmdir(legacy_dir) == 0);
+    }
+    fp = fopen(source, "a");
+    assert(fp && fputs("Changed book\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(cache_document_path(source, "txt", changed_text, sizeof changed_text,
+                               &cache_hit) == 0 && !cache_hit);
+    assert(strcmp(cached_text, changed_text));
+    mobi_mode = epub_mode = 0;
+    assert(rmdir(cache_dir) == 0);
+
+    DIR *dir = opendir(directory);
+    assert(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        assert(!strstr(entry->d_name, ".tmp."));
+    assert(closedir(dir) == 0);
+    assert(unlink(source) == 0);
+    assert(unlink(output) == 0);
+    assert(rmdir(directory) == 0);
+    if (old_path) {
+        assert(setenv("PATH", old_path, 1) == 0);
+        free(old_path);
+    } else {
+        assert(unsetenv("PATH") == 0);
+    }
+    if (old_cache) {
+        assert(setenv("XDG_CACHE_HOME", old_cache, 1) == 0);
+        free(old_cache);
+    } else {
+        assert(unsetenv("XDG_CACHE_HOME") == 0);
+    }
+}
+
+static void write_fixture(const char *path)
+{
+    FILE *fp = fopen(path, "w");
+
+    assert(fp);
+    assert(fputs(
+        "\f"
+        "                  READING TEST\n"
+        "\n"
+        "This is a deliberately long paragraph that should be reflowed to the "
+        "reader width instead of being clipped at both sides of the terminal.\n"
+        "It continues on a second source line so the reader must join it cleanly.\n"
+        "\n"
+        "42\n"
+        "\f"
+        "Contents\n"
+        "FIRST LINKED ENTRY\n"
+        "SECOND LINKED ENTRY\n"
+        "Version 1\n"
+        "\f"
+        "The next physical page remains visible and searchable.\n",
+        fp) >= 0);
+    assert(fclose(fp) == 0);
+}
+
+static void check_pdf_part_merge(void)
+{
+    char output[] = "/tmp/simplebook-merge-output.XXXXXX";
+    char paths[PDF_MAX_EXTRACT_JOBS][PATH_MAX] = {{0}};
+    char merged[64];
+    int output_fd = mkstemp(output);
+
+    assert(output_fd >= 0);
+    close(output_fd);
+
+    for (int i = 0; i < 2; i++) {
+        snprintf(paths[i], sizeof paths[i],
+                 "/tmp/simplebook-merge-part%d.XXXXXX", i);
+        int fd = mkstemp(paths[i]);
+        assert(fd >= 0);
+        FILE *fp = fdopen(fd, "w");
+        assert(fp);
+        assert(fputs(i == 0 ? "first\f" : "second\f", fp) >= 0);
+        assert(fclose(fp) == 0);
+    }
+
+    assert(merge_pdf_parts(output, paths, 2) == 0);
+    FILE *fp = fopen(output, "r");
+    assert(fp);
+    size_t bytes = fread(merged, 1, sizeof merged - 1, fp);
+    assert(!ferror(fp));
+    merged[bytes] = 0;
+    assert(fclose(fp) == 0);
+    assert(!strcmp(merged, "first\fsecond\f"));
+
+    unlink(output);
+    remove_pdf_parts(paths, 2);
+}
+
+static void check_epub_helpers(void)
+{
+    const char *html =
+        "<html><head><title>Hidden title</title></head><body>"
+        "<h1>CHAPTER ONE</h1><p>First &amp; second.</p>"
+        "<script>hidden()</script><p>It&rsquo;s readable: © naïve.</p>"
+        "<ul><li>One</li><li>Two</li></ul>"
+        "</body></html>";
+    char *plain = simpleepub_html_to_text_with_spine(html, strlen(html),
+                                                     NULL);
+    assert(plain);
+    assert(strstr(plain, "CHAPTER ONE\n\nFirst & second."));
+    assert(strstr(plain, "It’s readable: © naïve."));
+    assert(strstr(plain, "\n* One\n* Two"));
+    assert(!strstr(plain, "Hidden title"));
+    assert(!strstr(plain, "hidden()"));
+    free(plain);
+
+    const char *opf =
+        "<package><manifest>"
+        "<item id=\"second\" href=\"Text/two.xhtml\" "
+        "media-type=\"application/xhtml+xml\"/>"
+        "<item id=\"first\" href=\"Text/one.xhtml\" "
+        "media-type=\"application/xhtml+xml\"/>"
+        "</manifest><spine>"
+        "<itemref idref=\"first\"/><itemref idref=\"second\"/>"
+        "</spine></package>";
+    SimpleEpubList spine = {0};
+    assert(simpleepub_spine_from_opf(opf, "OPS/content.opf", &spine) == 0);
+    assert(spine.count == 2);
+    assert(!strcmp(spine.items[0], "OPS/Text/one.xhtml"));
+    assert(!strcmp(spine.items[1], "OPS/Text/two.xhtml"));
+    simpleepub_list_free(&spine);
+
+    SimpleEpubList documents = {0};
+    assert(simpleepub_list_add(&documents, "OPS/Text/contents.xhtml") == 0);
+    assert(simpleepub_list_add(&documents, "OPS/Text/chapter.xhtml") == 0);
+    const char *linked_html =
+        "<html><body><div id=\"contents\"><p>"
+        "<a href=\"chapter.xhtml#start\">Chamber Music</a> "
+        "<a href=\"#contents\">Back</a></p>"
+        "<p><a href=\"chapter.xhtml#i1\">[I.1]</a> "
+        "<a href=\"chapter.xhtml#i2\">[I.2]</a> "
+        "<a href=\"chapter.xhtml#i3\">[I.3]</a> "
+        "<a href=\"chapter.xhtml#i4\">[I.4]</a></p>"
+        "<p><a href=\"chapter.xhtml#i3\">IV</a> "
+        "<a href=\"chapter.xhtml#i4\">V</a></p>"
+        "</div></body></html>"
+        "<html><body><h1 id=\"start\">C H A M B E R M U S I C</h1>"
+        "<p><span id=\"i1\">One</span> <span id=\"i2\">Two</span> "
+        "<span id=\"i3\">Three</span> <span id=\"i4\">Four</span></p>"
+        "</body></html>";
+    plain = simpleepub_html_to_text_with_spine(
+        linked_html, strlen(linked_html), &documents);
+    assert(plain && strchr(plain, SIMPLEEPUB_MARKER_START));
+
+    char linked_path[] = "/tmp/simplebook-epub-links.XXXXXX";
+    int linked_fd = mkstemp(linked_path);
+    assert(linked_fd >= 0);
+    FILE *linked_file = fdopen(linked_fd, "w");
+    assert(linked_file);
+    assert(fputs(plain, linked_file) >= 0);
+    assert(fclose(linked_file) == 0);
+    free(plain);
+    simpleepub_list_free(&documents);
+
+    epub_mode = 1;
+    reading_mode = 1;
+    load_epub_text(linked_path, 100, 40);
+    materialize_epub_links();
+    assert(epub_target_count == 8);
+    assert(document_link_count == 8);
+    assert(epub_exact_link_count == 8);
+    assert(!strcmp(document_links[0].label, "Chamber Music"));
+    assert(document_links[0].exact_source);
+    assert(document_links[0].target_line > document_links[0].line_idx);
+    assert(!strcmp(document_links[1].label, "Back"));
+    assert(document_links[1].target_line == 0);
+    assert(!strcmp(document_links[2].label, "[I.1]"));
+    assert(!strcmp(document_links[5].label, "[I.4]"));
+    assert(!strcmp(document_links[6].label, "IV"));
+    assert(!strcmp(document_links[7].label, "V"));
+    assert(document_links[6].line_idx == document_links[7].line_idx);
+    assert(document_links[6].start_byte == 0);
+    assert(document_links[7].start_byte == 3);
+
+    unlink(linked_path);
+    free_document_links();
+    free_epub_metadata();
+    free_lines();
+    epub_mode = 0;
+    reading_mode = 1;
+}
+
+static void check_viewport_link_selection(void)
+{
+    free_document_links();
+
+    const int positions[] = {5, 105, 115, 130};
+    for (size_t i = 0; i < sizeof positions / sizeof positions[0]; i++) {
+        char label[32];
+        snprintf(label, sizeof label, "Line %d", positions[i]);
+        append_document_link(label, label, 0, 0, 0, positions[i], 0);
+        DocumentLink *link = &document_links[document_link_count - 1];
+        link->exact_source = 1;
+        link->line_idx = positions[i];
+        link->start_byte = 0;
+        link->end_byte = (int)strlen(label);
+    }
+
+    int selected = link_from_viewport(0, 1, 100, 117);
+    assert(selected >= 0 && document_links[selected].line_idx == 105);
+    selected = link_from_viewport(0, -1, 100, 117);
+    assert(selected >= 0 && document_links[selected].line_idx == 115);
+    selected = link_from_viewport(0, 1, 118, 135);
+    assert(selected >= 0 && document_links[selected].line_idx == 130);
+    selected = link_from_viewport(0, -1, 118, 135);
+    assert(selected >= 0 && document_links[selected].line_idx == 130);
+
+    free_document_links();
+}
+
+static void check_background_link_scan(void)
+{
+    char directory[] = "/tmp/simplebook-link-worker.XXXXXX";
+    char tool[PATH_MAX];
+    char combined_path[PATH_MAX * 2];
+    char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+
+    assert(mkdtemp(directory));
+    snprintf(tool, sizeof(tool), "%s/pdftohtml", directory);
+    FILE *script = fopen(tool, "w");
+    assert(script);
+    assert(fputs("#!/bin/sh\nexec sleep 5\n", script) >= 0);
+    assert(fclose(script) == 0);
+    assert(chmod(tool, 0700) == 0);
+    snprintf(combined_path, sizeof(combined_path), "%s:%s", directory,
+             old_path ? old_path : "");
+    assert(setenv("PATH", combined_path, 1) == 0);
+
+    free_document_links();
+    epub_mode = 0;
+    page_count = 1;
+    snprintf(document_path, sizeof(document_path), "/tmp/fake.pdf");
+    int64_t started = sui_monotonic_ms();
+    assert(!ensure_pdf_links_for_range(0, 0));
+    assert(sui_monotonic_ms() - started < 100);
+    assert(pdf_link_worker_pid > 0);
+    assert(link_page_state[0] == 3);
+
+    pid_t worker = pdf_link_worker_pid;
+    cancel_pdf_link_worker();
+    for (int i = 0; i < 100; i++) {
+        pid_t result = waitpid(worker, NULL, WNOHANG);
+        if (result == worker || (result < 0 && errno == ECHILD))
+            break;
+        assert(result == 0 || errno == EINTR);
+        usleep(10000);
+    }
+    assert(waitpid(worker, NULL, WNOHANG) < 0 && errno == ECHILD);
+
+    if (old_path) {
+        assert(setenv("PATH", old_path, 1) == 0);
+        free(old_path);
+    } else {
+        assert(unsetenv("PATH") == 0);
+    }
+    assert(unlink(tool) == 0);
+    assert(rmdir(directory) == 0);
+    free_document_links();
+}
+
+int main(void)
+{
+    char path[] = "/tmp/simplebook-render-check.XXXXXX";
+    int fd;
+    int breaks = 0;
+    int last_break = -1;
+    int heading = -1;
+    int next_page_text = -1;
+    int left, view_w, max_hscroll;
+
+    setlocale(LC_ALL, "");
+
+    assert(pdf_extract_job_count_for(0, 16) == 1);
+    assert(pdf_extract_job_count_for(255, 16) == 1);
+    assert(pdf_extract_job_count_for(512, 16) == 2);
+    assert(pdf_extract_job_count_for(8665, 16) == PDF_MAX_EXTRACT_JOBS);
+    assert(pdf_extract_job_count_for(8665, 2) == 2);
+    check_pdf_part_merge();
+    check_mobi_conversion();
+    check_epub_helpers();
+    check_viewport_link_selection();
+    check_background_link_scan();
+
+    ensure_line_capacity(2);
+
+    fd = mkstemp(path);
+    assert(fd >= 0);
+    close(fd);
+    write_fixture(path);
+
+    epub_mode = 0;
+    reading_mode = 1;
+    load_reading_text(path, 80);
+
+    assert(wrap_width == 70);
+    assert(page_count == 4);
+    assert(line_count > 5);
+    assert(line_kinds[0] == LINE_PAGE_BREAK);
+    assert(page_for_line(0) == 1);
+    page_viewport(80, &left, &view_w, &max_hscroll);
+    assert(left == 5);
+    assert(view_w == 70);
+    assert(max_hscroll == 0);
+
+    for (int i = 0; i < line_count; i++) {
+        if (line_kinds[i] == LINE_PAGE_BREAK) {
+            breaks++;
+            last_break = i;
+        }
+        if (strstr(lines[i], "READING TEST"))
+            heading = i;
+        if (strstr(lines[i], "next physical page"))
+            next_page_text = i;
+        if (line_kinds[i] == LINE_BODY)
+            assert(visual_len(lines[i]) <= wrap_width);
+        assert(strcmp(lines[i], "42") != 0);
+    }
+
+    assert(breaks == 3);
+    assert(last_break > 0 && last_break + 1 < line_count);
+    assert(line_kinds[last_break - 1] == LINE_BLANK);
+    assert(line_kinds[last_break + 1] == LINE_BLANK);
+    assert(heading >= 0 && line_kinds[heading] == LINE_HEADING);
+    assert(next_page_text >= 0 && page_for_line(next_page_text) == 3);
+    int first_toc = -1;
+    int second_toc = -1;
+    for (int i = 0; i < line_count; i++) {
+        if (!strcmp(lines[i], "FIRST LINKED ENTRY"))
+            first_toc = i;
+        if (!strcmp(lines[i], "SECOND LINKED ENTRY"))
+            second_toc = i;
+    }
+    assert(first_toc >= 0 && second_toc == first_toc + 1);
+    assert(line_kinds[first_toc] == LINE_TOC);
+    assert(line_kinds[second_toc] == LINE_TOC);
+    assert(find_next_match("searchable", 0) == next_page_text);
+    assert(find_heading_target_after("READING TEST", 0, -1) == heading);
+
+    parse_pdftohtml_link_line(
+        "<text top=\"100\"><a href=\"fixture.html#2\">"
+        "The next physical page</a></text>\n", 3);
+    assert(document_link_count == 1);
+    remap_document_links();
+    assert(!strcmp(document_links[0].label, "The next physical page"));
+    assert(document_links[0].source_page == 3);
+    assert(document_links[0].target_page == 1);
+    assert(document_links[0].line_idx == next_page_text);
+    assert(document_links[0].start_byte == 0);
+
+    top = next_page_text;
+    selected_link = 0;
+    assert(follow_selected_link());
+    assert(page_for_line(top) == 1);
+    assert(nav_history_count == 1);
+    assert(pop_nav_history());
+    assert(top == next_page_text);
+    assert(nav_history_count == 0);
+
+    append_extracted_link("1 2 3", 1, 1);
+    assert(document_link_count == 4);
+    assert(!strcmp(document_links[1].label, "1"));
+    assert(!strcmp(document_links[2].label, "2"));
+    assert(!strcmp(document_links[3].label, "3"));
+    assert(document_links[2].source_offset == 2);
+    free_document_links();
+
+    size_t old_capacity = line_capacity;
+    ensure_line_capacity(old_capacity + 1);
+    assert(line_capacity > old_capacity);
+    assert(next_page_text < line_count);
+    assert(strstr(lines[next_page_text], "next physical page"));
+
+    reading_mode = 0;
+    load_layout_text(path);
+    assert(page_count == 4);
+    assert(line_kinds[0] == LINE_PAGE_BREAK);
+    assert(page_for_line(0) == 1);
+    assert(page_width() > 0);
+    page_viewport(80, &left, &view_w, &max_hscroll);
+    assert(left >= 2);
+    assert(view_w <= 76);
+
+    unlink(path);
+    free_lines();
+    free(lines);
+    free(line_kinds);
+    free(line_pages);
+    lines = NULL;
+    line_kinds = NULL;
+    line_pages = NULL;
+    line_capacity = 0;
+    return 0;
+}

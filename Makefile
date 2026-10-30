@@ -1,0 +1,1063 @@
+CC ?= cc
+CFLAGS ?= -O2
+CXXFLAGS ?= -O2
+WARNING_CFLAGS ?= -O2 -Wall -Wextra -Werror
+CPPFLAGS ?=
+LDFLAGS ?=
+PKG_CONFIG ?= pkg-config
+UNAME_S ?= $(shell uname -s)
+ifneq ($(shell uname -s),FreeBSD)
+$(error This checkout targets FreeBSD; use https://github.com/kjwat/simplesuite on this host)
+endif
+ifeq ($(UNAME_S),FreeBSD)
+ifneq ($(wildcard /usr/local/lib/simpleos/libsidplayfp-2.12.0/lib/pkgconfig/libsidplayfp.pc),)
+export PKG_CONFIG_PATH := /usr/local/lib/simpleos/libsidplayfp-2.12.0/lib/pkgconfig:$(PKG_CONFIG_PATH)
+LDFLAGS += -Wl,-rpath,/usr/local/lib/simpleos/libsidplayfp-2.12.0/lib
+endif
+endif
+PYTHON ?= python3
+GCOV ?= gcov
+SIMPLESUITE_SOURCE_SHA ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf '%s' unknown)
+SIMPLESUITE_REQUIRE_CLEAN ?= 0
+SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
+SIMPLEWORDS_BUILD_REVISION ?= $(SIMPLESUITE_SOURCE_SHA)$(SIMPLESUITE_WORKTREE_SUFFIX)
+SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BUILD_REVISION)\"
+SIMPLEBOOK_MOBI_DIR := third_party/libmobi
+SIMPLEBOOK_MOBI_SOURCES := $(wildcard $(SIMPLEBOOK_MOBI_DIR)/src/*.c) \
+	$(SIMPLEBOOK_MOBI_DIR)/tools/common.c $(SIMPLEBOOK_MOBI_DIR)/tools/mobitool.c
+SIMPLEBOOK_MOBI_HEADERS := $(wildcard $(SIMPLEBOOK_MOBI_DIR)/src/*.h) \
+	$(SIMPLEBOOK_MOBI_DIR)/tools/common.h
+SIMPLEBOOK_MOBI_CPPFLAGS := -I$(SIMPLEBOOK_MOBI_DIR)/src \
+	-DHAVE_GETOPT=1 -DHAVE_STRDUP=1 -DHAVE_ATTRIBUTE_NORETURN=1 \
+	-DUSE_XMLWRITER=1 -DUSE_MINIZ=1 -DUSE_ENCRYPTION=1 \
+	-DPACKAGE_VERSION=\"0.12\" -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES= \
+	-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE=1
+
+.SILENT:
+
+BUILD_DIR ?= build
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
+SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
+SIMPLESUITE_UNINSTALLER := simplesuite-uninstall
+SIMPLESUITE_ABBREVIATIONS := $(BUILD_DIR)/command-abbreviations
+SIMPLESUITE_PROGRAM_MANIFEST := program-manifest.sh
+SIMPLESUITE_INSTALL_SIMPLESERVE ?= 1
+SIMPLEWORDS_SOUND_ASSETS := \
+	assets/simplewords-typewriter.wav \
+	assets/simplewords-typewriter-alt.wav \
+	assets/simplewords-typewriter-space.wav \
+	assets/simplewords-typewriter-enter.wav \
+	assets/simplewords-typewriter-delete.wav \
+	assets/simplewords-typewriter-NOTICE.md
+SIMPLESUITE_ASSETS := assets/simplecal-alarm.mp3 $(SIMPLEWORDS_SOUND_ASSETS)
+SIMPLECHANGE_SCREENSHOTS := screenshots/simplechange.png screenshots/simplechange-document.png screenshots/simplechange-ebook.png
+FREEBSD_HELPERS :=
+FREEBSD_TEST_TARGETS :=
+MACOS_PROGRAMS :=
+MACOS_TEST_TARGETS :=
+SIMPLESERVE_TEST_TARGETS :=
+SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simplevol-audio
+FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
+ifeq ($(UNAME_S),FreeBSD)
+FREEBSD_HELPERS := simplefiles-freebsd-unmount
+FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
+endif
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
+ifeq ($(UNAME_S),Linux)
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
+else ifneq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
+$(error SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1)
+endif
+ifeq ($(UNAME_S),Darwin)
+MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
+MACOS_TEST_TARGETS := test-macos-helpers
+SCRIPTS := simplebrowse-jsdump simplemail-fetch simplechange-engine
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
+endif
+
+MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
+PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
+ifneq ($(filter simplebook,$(PROGRAMS)),)
+ifeq ($(filter simplebook-mobi,$(PROGRAMS)),)
+override PROGRAMS += simplebook-mobi
+endif
+endif
+INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
+TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
+	test-simplefiles-network \
+	test-simplebook-render test-simplebook-picker test-simplefiles-drive test-simplefiles-image \
+	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
+	test-simplefiles-udisks \
+	test-simplepod-ipc \
+	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
+	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
+	test-simplewords-persistence test-simplewords-state test-simplewords-undo test-simplewords-clipboard test-simplewords-pty \
+	test-simplenet test-simpleblue test-simplenews-render \
+	test-simplenote-store test-simplenote-mouse test-simplenote-pty test-text-surface \
+	test-simplebrowse-link-nav test-simplebrowse-disambig \
+	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
+	test-simplebrowse-render test-simplebrowse-compat test-simplebrowse-webkit \
+	test-install-uninstall test-install-paths test-build-bootstrap test-reminder-install \
+	test-simpleserve-role $(FREEBSD_TEST_TARGETS) \
+	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
+
+BUILD_DIR_ABSOLUTE := $(abspath $(BUILD_DIR))
+BUILD_DIR_RESOLVED := $(if $(realpath $(BUILD_DIR)),$(realpath $(BUILD_DIR)),$(BUILD_DIR_ABSOLUTE))
+SOURCE_DIR_RESOLVED := $(realpath $(CURDIR))
+ifeq ($(BUILD_DIR_RESOLVED),$(SOURCE_DIR_RESOLVED))
+TARGET_PREFIX :=
+else
+TARGET_PREFIX := $(BUILD_DIR)/
+endif
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(TARGET_PREFIX),)
+$(error macOS native helper builds require BUILD_DIR outside the source root)
+endif
+endif
+
+BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
+HELPER_BINARIES := $(FREEBSD_HELPERS:%=$(TARGET_PREFIX)%)
+
+NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
+NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
+SIMPLEBURN_LIBS :=
+ifeq ($(UNAME_S),Darwin)
+SIMPLEBURN_LIBS := -framework CoreFoundation
+else ifeq ($(UNAME_S),FreeBSD)
+SIMPLEBURN_LIBS := -lgeom
+endif
+GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
+GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
+SIMPLENET_WITH_NM ?= $(if $(filter Linux,$(UNAME_S)),1,0)
+ifeq ($(SIMPLENET_WITH_NM),1)
+LIBNM_CFLAGS := $(shell $(PKG_CONFIG) --cflags 'libnm >= 1.24' 2>/dev/null) -DHAVE_LIBNM=1
+LIBNM_LIBS := $(shell $(PKG_CONFIG) --libs 'libnm >= 1.24' 2>/dev/null)
+else ifneq ($(SIMPLENET_WITH_NM),0)
+$(error SIMPLENET_WITH_NM must be 0 or 1)
+endif
+CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
+CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
+OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
+OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
+AVAHI_CFLAGS := $(shell $(PKG_CONFIG) --cflags avahi-client 2>/dev/null)
+AVAHI_LIBS := $(shell $(PKG_CONFIG) --libs avahi-client 2>/dev/null || printf '%s' '-lavahi-client -lavahi-common')
+SIMPLESERVE_DISCOVERY_CFLAGS := $(AVAHI_CFLAGS)
+SIMPLESERVE_DISCOVERY_LIBS := $(AVAHI_LIBS)
+ICONV_CFLAGS :=
+ICONV_LIBS :=
+MINIAUDIO_LIBS := -pthread -lm
+SIMPLESTATS_SOURCES := simplestats.c
+SIMPLESTATS_LIBS :=
+SIMPLENET_SOURCES := simplenet.c
+ifeq ($(SIMPLENET_WITH_NM),1)
+SIMPLENET_CFLAGS := $(LIBNM_CFLAGS)
+SIMPLENET_LIBS := $(LIBNM_LIBS)
+else
+SIMPLENET_CFLAGS :=
+SIMPLENET_LIBS :=
+endif
+SIMPLEBLUE_SOURCES := simpleblue.c
+SIMPLEBLUE_LIBS :=
+SIMPLEFILES_PLATFORM_SOURCES :=
+SIMPLEFILES_PLATFORM_DEPS :=
+SIMPLEFILES_PLATFORM_LIBS :=
+SIMPLEVIS_INFO_PLIST_FLAGS :=
+ifeq ($(UNAME_S),Linux)
+MINIAUDIO_LIBS += -ldl
+SCRIPTS += simplevol-audio
+TEST_TARGETS += test-simplevol
+endif
+ifeq ($(UNAME_S),Darwin)
+MACOSX_DEPLOYMENT_TARGET ?= 14.2
+export MACOSX_DEPLOYMENT_TARGET
+override CPPFLAGS += -D_DARWIN_C_SOURCE
+ICONV_LIBS := -liconv
+MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
+SIMPLESTATS_SOURCES += simplestats-macos.m
+SIMPLESTATS_LIBS += -framework Foundation -framework CoreWLAN -framework IOKit
+SIMPLEFILES_PLATFORM_SOURCES += simplefiles-macos.m
+SIMPLEFILES_PLATFORM_DEPS += simplefiles-macos.h
+SIMPLEFILES_PLATFORM_LIBS += -framework Foundation -framework DiskArbitration -framework IOKit
+SIMPLEVIS_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleVisInfo.plist
+SIMPLESERVE_DISCOVERY_CFLAGS :=
+SIMPLESERVE_DISCOVERY_LIBS := -ldns_sd
+endif
+ifeq ($(UNAME_S),FreeBSD)
+ICONV_CFLAGS := -I/usr/local/include
+ICONV_LIBS := -L/usr/local/lib -liconv
+endif
+
+.PHONY: all install install-payload install-freebsd-unmount-helper install-simpleserve-system \
+	verify-simpleserve-system uninstall-simpleserve-system \
+	verify-freebsd-unmount-helper uninstall-freebsd-unmount-helper \
+	uninstall clean check-warnings check-simplewords-source \
+	check-simplewords-coverage test-simplewords-sanitizers \
+	release-simplewords test FORCE \
+	$(TEST_TARGETS)
+
+all: $(BINARIES) $(HELPER_BINARIES)
+
+# Complete desktop payload used by SimpleOS updates and image builds. Keep
+# application-specific packaging here so callers never maintain their own list.
+FULL_PROGRAMS := simpleterm simpleplay-core
+ifneq ($(UNAME_S),Darwin)
+FULL_PROGRAMS += simpleplay simplepdf
+endif
+.PHONY: full install-full test-full test-suite-full
+full: all $(FULL_PROGRAMS)
+
+install-full: full
+	test "$(PREFIX)" = /usr/local || { printf '%s\n' 'The complete desktop installation requires PREFIX=/usr/local.' >&2; exit 1; }
+	+$(MAKE) --no-print-directory install
+	DESTDIR="$(DESTDIR)" SIMPLETERM_BUILD_DIR="$(abspath $(BUILD_DIR))" sh ./install-simpleterm.sh --copy-built
+	DESTDIR="$(DESTDIR)" SIMPLEPLAY_BUILD_DIR="$(abspath $(BUILD_DIR))" SIMPLEPLAY_HEADLESS_ONLY=$(if $(filter Darwin,$(UNAME_S)),1,0) sh ./install-simpleplay.sh --copy-built
+ifneq ($(UNAME_S),Darwin)
+	DESTDIR="$(DESTDIR)" SIMPLEPDF_BUILD_DIR="$(abspath $(BUILD_DIR))" sh ./install-simplepdf.sh --copy-built
+endif
+	{ cat "$(SIMPLESUITE_ABBREVIATIONS)"; sh -c '. ./program-manifest.sh; simplesuite_desktop_aliases "$$1"' sh '$(UNAME_S)' | tr ':' ' '; } > "$(BUILD_DIR)/command-abbreviations.full"
+	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		install -m 644 "$(abspath $(BUILD_DIR))/command-abbreviations.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"
+	cp "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest" "$(BUILD_DIR)/install-manifest.full"
+	printf 'payload_scope=full\nretired_paths=bin/simplepdf-mobi bin/simpleread bin/simpleread-mobi share/applications/simplepdf.desktop share/applications/simpleread.desktop\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
+	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		/bin/sh -ec 'tmp=$$2/.install-manifest.full.tmp; cp "$$1" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$$2/install-manifest"' \
+		sh "$(abspath $(BUILD_DIR))/install-manifest.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)"
+
+test-full: test test-simpleterm test-simpleterm-platform test-simpleterm-install test-suite-full
+ifeq ($(UNAME_S),Darwin)
+test-full: test-simpleplay-frontends
+else
+test-full: test-simpleplay test-simpleplay-frontends test-simpleplay-install test-simplepdf
+endif
+
+test-suite-full:
+	$(PYTHON) tests/suite-full-check.py
+
+# Optional desktop application. Keep GTK/VTE out of all, install, and the
+# program manifest consumed by Scriptorium. Its installer is opt-in only.
+GLIB_COMPILE_RESOURCES ?= glib-compile-resources
+SIMPLETERM_PLATFORM_SOURCES :=
+SIMPLETERM_PLATFORM_LIBS :=
+ifeq ($(UNAME_S),FreeBSD)
+SIMPLETERM_PLATFORM_LIBS += -lm
+endif
+SIMPLETERM_PLATFORM_ICON :=
+ifeq ($(UNAME_S),Darwin)
+SIMPLETERM_PLATFORM_SOURCES := simpleterm-macos.m
+SIMPLETERM_PLATFORM_LIBS := -framework AppKit
+SIMPLETERM_PLATFORM_ICON := $(BUILD_DIR)/simpleterm.icns
+endif
+
+.PHONY: simpleterm test-simpleterm test-simpleterm-platform test-simpleterm-compat test-simpleterm-install
+simpleterm: $(BUILD_DIR)/simpleterm $(SIMPLETERM_PLATFORM_ICON)
+
+$(BUILD_DIR)/simpleterm.icns: $(BUILD_DIR)/simpleterm-icon-build assets/simpleterm.png
+	"$(BUILD_DIR)/simpleterm-icon-build" assets/simpleterm.png "$@"
+
+$(BUILD_DIR)/simpleterm-icon-build: simpleterm-icon-build.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gdk-pixbuf-2.0 ) $< $(LDFLAGS) $$( $(PKG_CONFIG) --libs gdk-pixbuf-2.0 ) -o $@
+
+$(BUILD_DIR)/simpleterm-resources.c: assets/simpleterm.gresource.xml assets/simpleterm.png | $(BUILD_DIR)
+	"$(GLIB_COMPILE_RESOURCES)" --sourcedir=assets --generate-source --c-name=simpleterm --target="$@" $<
+
+$(BUILD_DIR)/simpleterm: simpleterm.c simpleterm-settings.c simpleterm-settings.h simpleterm-macos.h $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8 || { printf '%s\n' 'Run ./install-simpleterm.sh to install the Simpleterm build dependencies.' >&2; exit 1; }
+	printf '  CC  simpleterm\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) simpleterm.c simpleterm-settings.c $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) $(SIMPLETERM_PLATFORM_LIBS) -o $@
+
+$(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c simpleterm-settings.c simpleterm-settings.h simpleterm-macos.h $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -DSIMPLETERM_PROMPT_RC='"$(abspath assets/simpleterm-bashrc)"' $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) tests/simpleterm-check.c simpleterm-settings.c $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) $(SIMPLETERM_PLATFORM_LIBS) -o $@
+
+test-simpleterm: $(BUILD_DIR)/simpleterm $(BUILD_DIR)/simpleterm-check
+	$(PYTHON) tests/simpleterm-prompt-check.py
+	$(PYTHON) tests/simpleterm-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
+
+test-simpleterm-compat:
+	$(MAKE) BUILD_DIR=$(BUILD_DIR)/simpleterm-compat CPPFLAGS='$(CPPFLAGS) -DSIMPLETERM_TEST_LEGACY_VTE -DSIMPLETERM_TEST_LEGACY_GLIB' test-simpleterm
+
+test-simpleterm-platform: $(BUILD_DIR)/simpleterm
+	$(PYTHON) tests/simpleterm-platform-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
+
+test-simpleterm-install:
+	$(PYTHON) tests/simpleterm-install-check.py
+
+# Optional GTK/FFmpeg player; its dependencies and installation are independent
+# of the terminal suite, just like Simpleterm.
+SIMPLEPLAY_CORE_PACKAGES := gio-2.0 cairo libavformat libavcodec libavutil libavfilter libswscale libswresample sdl2 libass fluidsynth libsidplayfp json-glib-1.0
+SIMPLEPLAY_PACKAGES := gtk+-3.0 $(SIMPLEPLAY_CORE_PACKAGES)
+SIMPLEPLAY_SID_LIBS ?= $$( $(PKG_CONFIG) --libs libsidplayfp )
+ifeq ($(UNAME_S),Darwin)
+SIMPLEPLAY_CXX_LIBS := -lc++
+else
+SIMPLEPLAY_CXX_LIBS := -lc++
+endif
+SIMPLEPLAY_C_PACKAGES := $(filter-out libsidplayfp,$(SIMPLEPLAY_PACKAGES))
+.PHONY: simpleplay simpleplay-core test-simpleplay test-simpleplay-menu test-simpleplay-presentation test-simpleplay-install
+simpleplay: $(BUILD_DIR)/simpleplay $(BUILD_DIR)/simpleplay-core
+simpleplay-core: $(BUILD_DIR)/simpleplay-core
+
+$(BUILD_DIR)/simpleplay-synth.o: simpleplay-synth.cpp simpleplay-synth.h | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'glib-2.0 >= 2.66' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_CORE_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the playback dependencies.' >&2; exit 1; }
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) -c simpleplay-synth.cpp -o $@
+
+$(BUILD_DIR)/simpleplay: simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the SimplePlay build dependencies.' >&2; exit 1; }
+	printf '  CC  simpleplay\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) simpleplay.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simpleplay-core: simpleplay-core.c simpleplay-headless.c simpleplay-headless.h simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	printf '  CC  simpleplay-core\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) simpleplay-core.c simpleplay-headless.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simpleplay-engine-check: tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simpleplay-menu-check: tests/simpleplay-menu-check.c simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-menu-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+test-simpleplay-menu: $(BUILD_DIR)/simpleplay-menu-check
+	$(PYTHON) tests/simpleplay-menu-check.py "$(abspath $(BUILD_DIR))"
+
+$(BUILD_DIR)/simpleplay-presentation-check: tests/simpleplay-presentation-check.c simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-presentation-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+test-simpleplay-presentation: $(BUILD_DIR)/simpleplay-presentation-check
+	$(PYTHON) tests/simpleplay-presentation-check.py "$(abspath $(BUILD_DIR))"
+
+test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check test-simpleplay-menu test-simpleplay-presentation
+	$(PYTHON) tests/simpleplay-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-deinterlace-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-video-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-formats-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-core-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-audio-check.py "$(abspath $(BUILD_DIR))"
+
+test-simpleplay-install:
+	$(PYTHON) tests/simpleplay-install-check.py
+
+test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
+test: $(TEST_TARGETS)
+
+ifneq ($(TARGET_PREFIX),)
+.PHONY: $(PROGRAMS)
+$(PROGRAMS): %: $(TARGET_PREFIX)%
+endif
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(SIMPLESUITE_ABBREVIATIONS): $(SIMPLESUITE_PROGRAM_MANIFEST) FORCE | $(BUILD_DIR)
+	tmp="$@.tmp"; sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_program_aliases "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)' | tr : ' ' > "$$tmp"; mv -f "$$tmp" "$@"
+
+$(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplesearch: simplesearch.c simpleui.h | $(BUILD_DIR)
+	printf '  CC  simplesearch\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplesearch.c $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simpleburn: simpleburn.c simpleburn-platform.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  simpleburn\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $@
+
+$(TARGET_PREFIX)simplechange: simplechange.c simpleproc.h simpleui.h $(TARGET_PREFIX)simplechange-engine | $(BUILD_DIR)
+	printf '  CC  simplechange\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplechange.c $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplechange-engine: simplechange-engine | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
+
+.PHONY: test-simplechange-integration
+test-simplechange: $(TARGET_PREFIX)simplechange tests/simplechange-check.py tests/simplechange-pty-check.py
+	$(PYTHON) tests/simplechange-check.py
+	$(PYTHON) tests/simplechange-pty-check.py $(abspath $(TARGET_PREFIX)simplechange)
+
+test-simplechange-integration: $(TARGET_PREFIX)simplechange tests/simplechange-integration.py
+	$(PYTHON) tests/simplechange-integration.py $(abspath $(TARGET_PREFIX)simplechange)
+
+$(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) simplefiles.c simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $@
+
+$(TARGET_PREFIX)simplefiles-macos-helper: simplefiles-macos-helper.m | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -framework Foundation -o $@
+
+ifeq ($(UNAME_S),Darwin)
+$(TARGET_PREFIX)simplebrowse-webkitd: simplebrowse-webkitd-macos.m | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc $< $(LDFLAGS) \
+		-framework Foundation -framework AppKit -framework WebKit -o $@
+else ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplebrowse-webkitd: simplebrowse-webkitd | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
+
+$(TARGET_PREFIX)simplevis-macos-capture: simplevis-macos-capture.m macos/SimpleVisInfo.plist | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc $< $(LDFLAGS) $(SIMPLEVIS_INFO_PLIST_FLAGS) \
+		-framework Foundation -framework CoreAudio -lm -o $@
+
+$(TARGET_PREFIX)simplefiles-freebsd-unmount: simplefiles-freebsd-unmount.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/simplebrowse-document.o: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 \
+		-Dmain=simplebrowse_embedded_program_main -c simplebrowse.c -o $@
+
+$(TARGET_PREFIX)simplemail: simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR) $(TARGET_PREFIX)simplebrowse-webkitd
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simpleclock: simpleclock.c simpleproc.h simpleui.h simpleplay-client.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
+
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleflac: simpleplay-client.h
+
+$(TARGET_PREFIX)simplepod: simplepod.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simpleradio: simpleradio.c simpleplay-client.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simplenews: simplenews.c simplehtml.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+
+$(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLESTATS_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $@
+
+.PHONY: check-simplenet-backend
+check-simplenet-backend:
+ifeq ($(SIMPLENET_WITH_NM),1)
+	@test -n "$(SIMPLENET_LIBS)" || { \
+		echo 'SimpleNet needs libnm >= 1.24 development files (libnm-dev / NetworkManager-devel).' >&2; \
+		echo 'For a standalone wpa_supplicant build, explicitly set SIMPLENET_WITH_NM=0 and run simplenet -b wpa.' >&2; \
+		exit 1; }
+endif
+
+$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-nm-agent.h simpleui.h FORCE | $(BUILD_DIR) check-simplenet-backend
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
+
+$(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplevol: simplevol.c simpleui.h $(TARGET_PREFIX)simplevol-audio $(BUILD_DIR)/simplevol-meter.so | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplevol.c $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simplevol-meter.so: simplevol-meter.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -fPIC -shared $< $(LDFLAGS) -o $@
+
+ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplevol-audio: simplevol-audio | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
+
+test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py tests/simplevol-responsiveness-pty.py tests/simplevol-system-sounds-check.py
+	$(PYTHON) tests/simplevol-check.py
+	$(PYTHON) tests/simplevol-pty-check.py $(abspath $(TARGET_PREFIX)simplevol)
+	$(PYTHON) tests/simplevol-responsiveness-pty.py $(abspath $(TARGET_PREFIX)simplevol)
+	$(PYTHON) tests/simplevol-system-sounds-check.py
+
+.PHONY: test-simplevol-audio test-simplevol-pipewire
+test-simplevol-audio: tests/simplevol-audio-check.py tests/simplevol-lv2-host.py simplevol-audio $(BUILD_DIR)/simplevol-meter.so
+	$(PYTHON) tests/simplevol-audio-check.py
+
+test-simplevol-pipewire: tests/simplevol-pipewire-check.py simplevol-audio $(BUILD_DIR)/simplevol-meter.so
+	$(PYTHON) tests/simplevol-pipewire-check.py
+
+$(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h FORCE | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(SIMPLEWORDS_REVISION_CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
+
+FORCE:
+
+$(TARGET_PREFIX)simpleserve: simpleserve.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) simpleserve.c simpleserve-common.c $(LDFLAGS) -o $@
+
+$(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simplebook-mobi: $(SIMPLEBOOK_MOBI_SOURCES) $(SIMPLEBOOK_MOBI_HEADERS) | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(SIMPLEBOOK_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEBOOK_MOBI_SOURCES) $(LDFLAGS) -o $@
+
+$(TARGET_PREFIX)simplebook: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplebook-mobi
+$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplebook $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
+$(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
+$(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h simpletext.h
+$(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simpletext.h
+test-simplenote-mouse test-simplerender-present test-simplemail-render test-simplenews-render \
+test-simplewords-typewriter test-simplewords-buffers test-simplewords-persistence \
+test-simplewords-state test-simplewords-undo test-simplewords-clipboard: simpletext.h
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock $(TARGET_PREFIX)simplewords: simplepaths.h
+
+test-reminder-install test-simpleclock-weather test-simplewords-typewriter \
+test-simplewords-buffers test-simplewords-persistence test-simplewords-state \
+test-simplewords-undo test-simplewords-clipboard: simplepaths.h
+
+check-warnings:
+	set -e; \
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplesuite-warnings.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	$(MAKE) --no-print-directory BUILD_DIR="$$check_dir" \
+		CFLAGS='$(WARNING_CFLAGS)' all; \
+	printf '  OK  warning-free build\n'
+
+test-simplenote-store: tests/simplenote-store-check.c simplenote-store.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenote-store-check.c -o $(BUILD_DIR)/simplenote-store-check
+	$(BUILD_DIR)/simplenote-store-check
+
+test-simplenote-mouse: tests/simplenote-mouse-check.c simplenote.c simplenote-store.h simplerender.h simpleui.h simpleproc.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplenote-mouse-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenote-mouse-check
+	$(BUILD_DIR)/simplenote-mouse-check
+
+test-simplenote-pty: $(TARGET_PREFIX)simplenote tests/simplenote-pty-check.py
+	$(PYTHON) tests/simplenote-pty-check.py $(abspath $(TARGET_PREFIX)simplenote)
+
+$(BUILD_DIR)/text-surface-note-check: tests/text-surface-check.c simplenote.c simplenote-store.h simplerender.h simpletext.h simpleui.h simpleproc.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSURFACE_NOTE tests/text-surface-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(BUILD_DIR)/text-surface-words-check: tests/text-surface-check.c simplewords.c simpletext.h simplepaths.h simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/text-surface-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
+
+.PHONY: test-text-surface
+test-text-surface: $(BUILD_DIR)/text-surface-note-check $(BUILD_DIR)/text-surface-words-check tests/text-surface-check.py
+	$(PYTHON) tests/text-surface-check.py $(BUILD_DIR)/text-surface-words-check $(BUILD_DIR)/text-surface-note-check
+
+test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
+	$(BUILD_DIR)/simpleui-check
+
+test-simplestats: tests/simplestats-check.c $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(filter-out simplestats.c,$(SIMPLESTATS_SOURCES)) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $(BUILD_DIR)/simplestats-check
+	$(BUILD_DIR)/simplestats-check
+
+test-reminder-install: $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock tests/reminder-install-check.py simplereminders.h
+	$(PYTHON) tests/reminder-install-check.py $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock
+
+test-simpleserve: tests/simpleserve-check.c \
+        tests/simpleserve-avahi-cache-check.c \
+        tests/simpleserve-offline-mount-check.c \
+        tests/simpleserve-reconnect-check.c \
+        tests/simpleserve-offline-check.py \
+        tests/simpleserve-daemon-check.sh \
+		tests/simpleserve-system-install-check.sh \
+		install-simpleserve-system.sh verify-simpleserve-system.sh \
+		simpleserve-role.sh \
+		simpleserve-common.c simpleserve.h $(TARGET_PREFIX)simpleserve \
+		$(TARGET_PREFIX)simpleserved | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleserve-check.c simpleserve-common.c $(LDFLAGS) -o $(BUILD_DIR)/simpleserve-check
+	$(BUILD_DIR)/simpleserve-check
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-avahi-cache-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-avahi-cache-check
+	$(BUILD_DIR)/simpleserve-avahi-cache-check
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-offline-mount-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-offline-mount-check
+	$(BUILD_DIR)/simpleserve-offline-mount-check
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-reconnect-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-reconnect-check
+	$(BUILD_DIR)/simpleserve-reconnect-check
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" $(PYTHON) tests/simpleserve-offline-check.py
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
+
+test-simplerender-present: tests/simplerender-present-check.c simplerender.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplerender-present-check
+	$(BUILD_DIR)/simplerender-present-check
+
+test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
+	$(BUILD_DIR)/simplemail-render-check
+
+test-simplemail-fetch: tests/simplemail-fetch-check.py simplemail-fetch
+	$(PYTHON) tests/simplemail-fetch-check.py
+
+test-simplemail-delivery: tests/simplemail-delivery-check.c simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-delivery-check
+	$(BUILD_DIR)/simplemail-delivery-check
+
+test-simplemail-delivery-pty: tests/simplemail-delivery-pty.py $(TARGET_PREFIX)simplemail
+	$(PYTHON) tests/simplemail-delivery-pty.py $(abspath $(TARGET_PREFIX)simplemail)
+
+test-simplebook-render: tests/simplebook-render-check.c simplebook.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplebook-render-check
+	$(BUILD_DIR)/simplebook-render-check
+
+test-simplebook-picker: $(TARGET_PREFIX)simplebook tests/simplebook-picker-check.py
+	$(PYTHON) tests/simplebook-picker-check.py $(abspath $(TARGET_PREFIX)simplebook)
+
+test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
+	$(BUILD_DIR)/simplenews-render-check
+
+test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
+	$(BUILD_DIR)/simplefiles-drive-check
+
+test-simplefiles-freebsd-unmount: tests/simplefiles-freebsd-unmount-check.c simplefiles-freebsd-unmount.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simplefiles-freebsd-unmount-check
+	$(BUILD_DIR)/simplefiles-freebsd-unmount-check
+
+test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
+	$(BUILD_DIR)/simplefiles-image-check
+
+test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
+	$(BUILD_DIR)/simplefiles-trash-check
+
+test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
+	$(BUILD_DIR)/simplefiles-background-check
+
+$(TARGET_PREFIX)simplefiles test-simplefiles-drive test-simplefiles-image test-simplefiles-trash test-simplefiles-background test-simplefiles-command test-simplefiles-network: simplefiles-network.h
+
+test-simplefiles-network: tests/simplefiles-network-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-network-check.c simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-network-check
+	$(BUILD_DIR)/simplefiles-network-check
+
+test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
+	$(BUILD_DIR)/simplefiles-command-check
+
+test-simplefiles-udisks: tests/simplefiles-udisks-check.c simplefiles-udisks.c simplefiles-udisks.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-udisks-check.c simplefiles-udisks.c $(LDFLAGS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-udisks-check
+	$(BUILD_DIR)/simplefiles-udisks-check
+
+test-simplepod-ipc: tests/simplepod-ipc-check.c simplepod.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $(BUILD_DIR)/simplepod-ipc-check
+	$(BUILD_DIR)/simplepod-ipc-check
+
+test-simpleradio-ipc: tests/simpleradio-ipc-check.c simpleradio.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simpleradio-ipc-check
+	$(BUILD_DIR)/simpleradio-ipc-check
+
+test-simpleflac-player: tests/simpleflac-player-check.c simpleflac.c simpleplay-client.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleflac-player-check
+	$(BUILD_DIR)/simpleflac-player-check
+
+.PHONY: test-simpleplay-frontends
+test-simpleplay-frontends: simpleplay-core
+	$(PYTHON) tests/simpleplay-frontends-check.py "$(abspath $(BUILD_DIR))"
+
+test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check
+	$(BUILD_DIR)/simplevis-color-check
+
+test-simplevis-spectrum: tests/simplevis-spectrum-check.c simplevis.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-spectrum-check
+	$(BUILD_DIR)/simplevis-spectrum-check
+
+test-simplevis-process: tests/simplevis-process-check.c simplevis.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-process-check
+	$(BUILD_DIR)/simplevis-process-check
+
+test-macos-helpers: $(TARGET_PREFIX)simplebrowse-webkitd $(TARGET_PREFIX)simplefiles-macos-helper $(TARGET_PREFIX)simplevis-macos-capture
+	$(TARGET_PREFIX)simplebrowse-webkitd --version
+	$(TARGET_PREFIX)simplefiles-macos-helper --version
+	$(TARGET_PREFIX)simplevis-macos-capture --version
+
+test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simpleclock-weather-check
+	$(BUILD_DIR)/simpleclock-weather-check
+
+test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
+	$(BUILD_DIR)/simplewords-typewriter-check
+
+test-simplewords-buffers: tests/simplewords-buffers-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-buffers-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-buffers-check
+	$(BUILD_DIR)/simplewords-buffers-check
+
+test-simplewords-persistence: tests/simplewords-persistence-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-persistence-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-persistence-check
+	$(BUILD_DIR)/simplewords-persistence-check
+
+test-simplewords-state: tests/simplewords-state-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-state-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-state-check
+	$(BUILD_DIR)/simplewords-state-check
+
+test-simplewords-undo: tests/simplewords-undo-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-undo-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-undo-check
+	$(BUILD_DIR)/simplewords-undo-check
+
+test-simplewords-clipboard: tests/simplewords-clipboard-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-clipboard-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-clipboard-check
+	$(BUILD_DIR)/simplewords-clipboard-check
+
+test-simplewords-pty: tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+	$(PYTHON) tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+
+check-simplewords-source:
+	@set -e; \
+	sha='$(SIMPLESUITE_SOURCE_SHA)'; \
+	test "$${#sha}" -eq 40 || { echo "SimpleSuite source SHA is not a 40-character commit: $$sha" >&2; exit 1; }; \
+	case "$$sha" in *[!0-9a-f]*) echo "SimpleSuite source SHA is not hexadecimal: $$sha" >&2; exit 1 ;; esac; \
+	if test '$(SIMPLESUITE_REQUIRE_CLEAN)' = 1; then \
+		if test -f .simpleos-freebsd-source.json && test ! -e .git; then \
+			test "$$(python3 verify-freebsd-source.py .)" = "$$sha"; \
+		else \
+		test "$$(git rev-parse --verify HEAD)" = "$$sha" || { echo "Fetched SimpleSuite HEAD does not match the gated SHA." >&2; exit 1; }; \
+		test -z "$$(git status --porcelain --untracked-files=normal)" || { echo "SimpleSuite release checkout is dirty." >&2; exit 1; }; \
+		fi; \
+	fi; \
+	printf '  OK  source revision %s%s\n' "$$sha" '$(SIMPLESUITE_WORKTREE_SUFFIX)'
+
+check-simplewords-coverage: tests/simplewords-persistence-check.c tests/simplewords-coverage-check.sh simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h
+	@set -e; \
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-coverage.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) -O0 -g --coverage \
+		"$(CURDIR)/tests/simplewords-persistence-check.c" \
+		"$(CURDIR)/third_party/miniaudio/miniaudio.c" \
+		$(LDFLAGS) --coverage $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) \
+		-o "$$check_dir/simplewords-persistence-check"; \
+	"$$check_dir/simplewords-persistence-check"; \
+	(cd "$$check_dir" && $(GCOV) -f \
+		-o "$$check_dir/simplewords-persistence-check-simplewords-persistence-check.gcno" \
+		"$(CURDIR)/simplewords.c" > "$$check_dir/functions.txt"); \
+	tests/simplewords-coverage-check.sh "$$check_dir/functions.txt"
+
+test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c tests/simplewords-undo-check.c tests/simplewords-clipboard-check.c
+	@set -e; \
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-sanitizers.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+	$(MAKE) --no-print-directory BUILD_DIR="$$check_dir" \
+		CFLAGS='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+		LDFLAGS='-fsanitize=address,undefined' \
+		test-simplewords-typewriter test-simplewords-buffers \
+		test-simplewords-persistence test-simplewords-state test-simplewords-undo test-simplewords-clipboard simplewords; \
+	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+		$(PYTHON) tests/simplewords-pty-check.py "$$check_dir/simplewords"; \
+	printf '  OK  ASan/UBSan SimpleWords suite\n'
+
+release-simplewords: check-simplewords-source
+	@set -e; \
+	$(MAKE) --no-print-directory check-warnings; \
+	unset SIMPLESUITE_INSTALL_SIMPLESERVE SIMPLESUITE_NETWORK_ROLE; \
+	$(MAKE) --no-print-directory test; \
+	$(MAKE) --no-print-directory test-simplewords-sanitizers; \
+	$(MAKE) --no-print-directory check-simplewords-coverage; \
+	$(MAKE) --no-print-directory simplewords; \
+	expected='simplewords $(SIMPLEWORDS_BUILD_REVISION)'; \
+	actual="$$( $(TARGET_PREFIX)simplewords --version )"; \
+	test "$$actual" = "$$expected" || { echo "SimpleWords version mismatch: $$actual (expected $$expected)" >&2; exit 1; }; \
+	printf '  OK  SimpleWords release gate %s\n' '$(SIMPLEWORDS_BUILD_REVISION)'
+
+test-simplenet: tests/simplenet-check.c tests/simplenet-nm-integration.py simplenet.c simplenet-nm-agent.h simpleui.h | $(BUILD_DIR) check-simplenet-backend
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $(BUILD_DIR)/simplenet-check
+ifeq ($(SIMPLENET_WITH_NM),1)
+	dbus-run-session -- env LIBNM_USE_SESSION_BUS=1 $(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
+	$(MAKE) --no-print-directory $(TARGET_PREFIX)simplenet
+	$(PYTHON) tests/simplenet-nm-integration.py $(abspath $(TARGET_PREFIX)simplenet)
+else
+	$(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
+endif
+
+test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c simpleblue.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleblue-bluetoothctl-mock.c $(LDFLAGS) -o $(BUILD_DIR)/bluetoothctl
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleblue-check
+	$(BUILD_DIR)/simpleblue-check $(abspath $(BUILD_DIR))
+
+test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
+	SIMPLESUITE_RELEASE_GATE_ACTIVE=1 tests/install-uninstall-check.sh
+
+test-install-paths: tests/install-paths-check.sh tests/simplepaths-check.c install-payload.sh simplepaths.h
+	CC="$(CC)" sh tests/install-paths-check.sh
+
+test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh \
+		simpleserve-role.sh
+	tests/build-bootstrap-check.sh
+
+test-simpleserve-role: tests/simpleserve-role-check.sh simpleserve-role.sh
+	tests/simpleserve-role-check.sh
+
+test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check
+	$(BUILD_DIR)/simplebrowse-link-nav-check
+
+test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-disambig-check
+	$(BUILD_DIR)/simplebrowse-disambig-check
+
+test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-hidden-form-check
+	$(BUILD_DIR)/simplebrowse-hidden-form-check
+
+test-simplebrowse-load: tests/simplebrowse-load-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-load-check
+	$(BUILD_DIR)/simplebrowse-load-check
+
+test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-media-check
+	$(BUILD_DIR)/simplebrowse-media-check
+
+test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
+	$(BUILD_DIR)/simplebrowse-render-check
+
+$(BUILD_DIR)/simplebrowse-compat-probe: tests/simplebrowse-compat-probe.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR) $(TARGET_PREFIX)simplebrowse-webkitd
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
+
+test-simplebrowse-compat: tests/simplebrowse-compat-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-compat-check
+	$(BUILD_DIR)/simplebrowse-compat-check
+
+test-simplebrowse-webkit: $(BUILD_DIR)/simplebrowse-compat-probe $(TARGET_PREFIX)simplebrowse
+	$(PYTHON) tests/simplebrowse-webkit-check.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --browser $(TARGET_PREFIX)simplebrowse
+
+# Explicit network tour: public pages can change, so this is outside `test`.
+.PHONY: tour-simplebrowse journeys-simplebrowse
+tour-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
+	$(PYTHON) tests/simplebrowse-tour.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-tour
+
+journeys-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
+	$(PYTHON) tests/simplebrowse-journeys.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-journeys
+
+install: all $(SIMPLESUITE_ASSETS) SIMPLECHANGE.md $(SIMPLECHANGE_SCREENSHOTS) uninstall.sh install-payload.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
+	+sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		$(MAKE) --no-print-directory -C "$(CURDIR)" install-payload \
+		"BUILD_DIR=$(BUILD_DIR)" "PREFIX=$(PREFIX)" "BINDIR=$(BINDIR)" \
+		"DATADIR=$(DATADIR)" "SIMPLESUITE_DATADIR=$(SIMPLESUITE_DATADIR)" \
+		"DESTDIR=$(DESTDIR)" "UNAME_S=$(UNAME_S)" \
+		"SIMPLESUITE_INSTALL_SIMPLESERVE=$(SIMPLESUITE_INSTALL_SIMPLESERVE)" \
+		"SIMPLESUITE_SOURCE_SHA=$(SIMPLESUITE_SOURCE_SHA)" \
+		"SIMPLEWORDS_BUILD_REVISION=$(SIMPLEWORDS_BUILD_REVISION)"
+	@if test -z "$(DESTDIR)" && test "$(BINDIR)" = /usr/local/bin && \
+		test -d "$(HOME)/.local/bin" && \
+		test "$$(cd "$(HOME)/.local/bin" && pwd -P)" != "$$(cd "$(BINDIR)" && pwd -P)"; then \
+		for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do \
+			test -x "$(BINDIR)/$$p" || exit 1; \
+			rm -f "$(HOME)/.local/bin/$$p"; \
+		done; \
+		while read short full extra; do \
+			case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+			alias_path="$(HOME)/.local/bin/$$short"; \
+			if test -L "$$alias_path"; then \
+				case "$$(readlink "$$alias_path")" in "$$full"|"$(HOME)/.local/bin/$$full"|"$(BINDIR)/$$full") rm -f "$$alias_path" ;; esac; \
+			fi; \
+		done < $(SIMPLESUITE_ABBREVIATIONS); \
+	fi
+
+# Copy only: the public install target finishes all compilation before sudo.
+install-payload:
+	mkdir -p $(DESTDIR)$(BINDIR)
+	set -e; while read short full extra; do \
+		case "$$short" in ''|'#'*) continue ;; *[!a-z0-9-]*) echo "Invalid short command in $(SIMPLESUITE_ABBREVIATIONS): $$short" >&2; exit 1 ;; esac; \
+		case "$$full" in simple*[!a-z0-9-]*|'') echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; simple*) ;; *) echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; esac; \
+		test -z "$$extra" || { echo "Extra field in $(SIMPLESUITE_ABBREVIATIONS) for $$short" >&2; exit 1; }; \
+		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+	done < $(SIMPLESUITE_ABBREVIATIONS)
+	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
+ifeq ($(UNAME_S),FreeBSD)
+	rm -f "$(DESTDIR)$(BINDIR)/simplefiles-freebsd-unmount"
+endif
+	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
+	tmp="$(DESTDIR)$(BINDIR)/.$(SIMPLESUITE_UNINSTALLER).tmp"; cp uninstall.sh "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$(SIMPLESUITE_UNINSTALLER)"
+	set -e; while read short full extra; do \
+		case "$$short" in ''|'#'*) continue ;; esac; \
+		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+		alias_path="$(DESTDIR)$(BINDIR)/$$short"; \
+		if test -L "$$alias_path"; then \
+			case "$$(readlink "$$alias_path")" in "$$full"|"$(BINDIR)/$$full") rm -f "$$alias_path" ;; esac; \
+		fi; \
+	done < $(SIMPLESUITE_ABBREVIATIONS)
+	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
+	cp SIMPLECHANGE.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLECHANGE.md"
+	mkdir -p "$(DESTDIR)$(SIMPLESUITE_DATADIR)/screenshots"
+	set -e; for shot in $(SIMPLECHANGE_SCREENSHOTS); do cp "$$shot" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$shot"; done
+ifneq ($(filter Linux FreeBSD,$(UNAME_S)),)
+	cp $(BUILD_DIR)/simplevol-meter.so "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
+	chmod 644 "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
+	mv -f "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplevol-meter.so"
+	cp SIMPLEVOL.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLEVOL.md"
+endif
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-manifest.tmp"; { printf 'simplesuite_source_sha=%s\n' '$(SIMPLESUITE_SOURCE_SHA)'; printf 'simplewords_build_revision=%s\n' '$(SIMPLEWORDS_BUILD_REVISION)'; } > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.command-abbreviations.tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$(SIMPLESUITE_PROGRAM_MANIFEST).tmp"; cp $(SIMPLESUITE_PROGRAM_MANIFEST) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$(SIMPLESUITE_PROGRAM_MANIFEST)"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
+	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
+	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
+	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source install-manifest command-abbreviations program-manifest.sh; do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
+	@printf 'Installed to %s\n' "$(BINDIR)"
+	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
+
+install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
+	test "$(UNAME_S)" = "FreeBSD"
+	mkdir -p "$(dir $(FREEBSD_UNMOUNT_HELPER))"
+	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; umask 022; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:operator "$$tmp"; chmod 4550 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
+	@printf 'Installed privileged FreeBSD unmount helper to %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
+		install-simpleserve-system.sh \
+		simpleserve-role.sh \
+		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
+		init/org.simplesuite.simpleserved.plist \
+		init/simpleserve.client.role init/simpleserve.server.role
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
+	sh ./install-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
+
+verify-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
+		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
+		simpleserve-role.sh \
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
+		init/org.simplesuite.simpleserved.plist \
+		init/simpleserve.client.role init/simpleserve.server.role
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
+	sh ./verify-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
+
+uninstall-simpleserve-system: uninstall-simpleserve-system.sh
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
+	sh ./uninstall-simpleserve-system.sh
+
+verify-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
+	test "$(UNAME_S)" = "FreeBSD"
+	test -x "$(FREEBSD_UNMOUNT_HELPER)"
+	cmp -s "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$(FREEBSD_UNMOUNT_HELPER)"
+	@printf 'Verified privileged FreeBSD helper at %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+uninstall-freebsd-unmount-helper:
+	test "$(UNAME_S)" = "FreeBSD"
+	rm -f "$(FREEBSD_UNMOUNT_HELPER)" "$(FREEBSD_UNMOUNT_HELPER).tmp"
+	@printf 'Removed privileged FreeBSD unmount helper from %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+uninstall:
+	PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" \
+		SIMPLESUITE_DATADIR="$(SIMPLESUITE_DATADIR)" DESTDIR="$(DESTDIR)" \
+		FREEBSD_UNMOUNT_HELPER="$(FREEBSD_UNMOUNT_HELPER)" \
+		./uninstall.sh
+
+clean:
+	rm -f $(BINARIES) $(HELPER_BINARIES)
+	@if [ "$(TARGET_PREFIX)" != "" ]; then rmdir "$(BUILD_DIR)" 2>/dev/null || true; fi
+
+.PHONY: test-simplesave
+test-simplesave: $(TARGET_PREFIX)simplesave tests/simplesave-check.py
+	$(PYTHON) tests/simplesave-check.py $(TARGET_PREFIX)simplesave
+
+test-simpleburn: $(TARGET_PREFIX)simpleburn tests/simpleburn-check.c tests/simpleburn-pty-check.py
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simpleburn-check.c $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $(BUILD_DIR)/simpleburn-check
+	$(BUILD_DIR)/simpleburn-check
+	$(PYTHON) tests/simpleburn-pty-check.py $(TARGET_PREFIX)simpleburn
+
+.PHONY: test-simplesearch
+test-simplesearch: $(TARGET_PREFIX)simplesearch tests/simplesearch-render-check.c tests/simplesearch-check.py
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplesearch-render-check.c $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplesearch-render-check
+	$(BUILD_DIR)/simplesearch-render-check $(BUILD_DIR)/simplesearch-preview.cells
+	$(PYTHON) tests/simplesearch-check.py $(TARGET_PREFIX)simplesearch
+
+.PHONY: test-simplewords-location
+test-simplewords-location: tests/simplewords-location-check.c tests/simplewords-location-pty.py simplewords.c simpleproc.h simplepaths.h simpletext.h $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplesearch | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-location-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-location-check
+	$(BUILD_DIR)/simplewords-location-check
+	$(PYTHON) tests/simplewords-location-pty.py $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplesearch
+
+.PHONY: test-simplewords-frames
+test-simplewords-frames: tests/simplewords-frames-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simplewords
+	$(PYTHON) tests/simplewords-frames-pty.py $(TARGET_PREFIX)simplewords
+
+# Optional native PDF viewer: terminal builds do not require GTK/Evince.
+SIMPLEPDF_PACKAGES := gtk+-3.0 gtk+-unix-print-3.0 evince-document-3.0 gthread-2.0
+SIMPLEPDF_VIEW_DIR := third_party/evince
+SIMPLEPDF_VIEW_BUILD := $(BUILD_DIR)/simplepdf-evince
+SIMPLEPDF_VIEW_SOURCES := $(wildcard $(SIMPLEPDF_VIEW_DIR)/libview/*.c)
+SIMPLEPDF_VIEW_HEADERS := $(wildcard $(SIMPLEPDF_VIEW_DIR)/libview/*.h $(SIMPLEPDF_VIEW_DIR)/libdocument/*.h) $(SIMPLEPDF_VIEW_DIR)/config.h
+SIMPLEPDF_VIEW_OBJECTS := $(patsubst $(SIMPLEPDF_VIEW_DIR)/libview/%.c,$(SIMPLEPDF_VIEW_BUILD)/%.o,$(SIMPLEPDF_VIEW_SOURCES)) $(SIMPLEPDF_VIEW_BUILD)/ev-view-marshal.o $(SIMPLEPDF_VIEW_BUILD)/ev-view-type-builtins.o
+SIMPLEPDF_VIEW_ENUM_HEADERS := ev-document-model.h ev-job-scheduler.h ev-jobs.h ev-print-operation.h ev-stock-icons.h ev-view-presentation.h ev-view.h
+SIMPLEPDF_VIEW_INCLUDES = -I$(SIMPLEPDF_VIEW_DIR) -I$(SIMPLEPDF_VIEW_DIR)/libview -I$(SIMPLEPDF_VIEW_DIR)/libdocument -I$(SIMPLEPDF_VIEW_BUILD) -I$(SIMPLEPDF_VIEW_BUILD)/libview -I. -I"$$( $(PKG_CONFIG) --variable=includedir evince-document-3.0 )/evince/3.0/libdocument"
+# Third-party code keeps upstream's warning policy, independently of app flags.
+SIMPLEPDF_VIEW_CFLAGS ?= -O2 -g -Wall -Wno-deprecated-declarations
+$(SIMPLEPDF_VIEW_BUILD)/libview:
+	mkdir -p $@
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-marshal.list | $(SIMPLEPDF_VIEW_BUILD)/libview
+	glib-genmarshal --prefix=ev_view_marshal --internal --prototypes --header --output=$@ $<
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.c: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-marshal.list $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h
+	glib-genmarshal --prefix=ev_view_marshal --internal --prototypes --body --include-header=ev-view-marshal.h --output=$@ $<
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-type-builtins.h.template $(SIMPLEPDF_VIEW_HEADERS) | $(SIMPLEPDF_VIEW_BUILD)/libview
+	glib-mkenums --template $< $(addprefix $(SIMPLEPDF_VIEW_DIR)/libview/,$(SIMPLEPDF_VIEW_ENUM_HEADERS)) > $@
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.c: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-type-builtins.c.template $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h
+	glib-mkenums --template $< $(addprefix $(SIMPLEPDF_VIEW_DIR)/libview/,$(SIMPLEPDF_VIEW_ENUM_HEADERS)) > $@
+$(SIMPLEPDF_VIEW_BUILD)/%.o: $(SIMPLEPDF_VIEW_DIR)/libview/%.c $(SIMPLEPDF_VIEW_HEADERS) $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h
+	$(CC) $(CPPFLAGS) $(SIMPLEPDF_VIEW_CFLAGS) $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) -DEVINCE_COMPILATION -DHAVE_CONFIG_H -DEVINCEDATADIR='"/usr/local/share/evince"' -c $< -o $@
+$(SIMPLEPDF_VIEW_BUILD)/%.o: $(SIMPLEPDF_VIEW_BUILD)/libview/%.c $(SIMPLEPDF_VIEW_HEADERS)
+	$(CC) $(CPPFLAGS) $(SIMPLEPDF_VIEW_CFLAGS) $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) -DEVINCE_COMPILATION -DHAVE_CONFIG_H -c $< -o $@
+$(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a: $(SIMPLEPDF_VIEW_OBJECTS)
+	$(AR) rcs $@ $^
+.PHONY: simplepdf test-simplepdf test-simplepdf-cache-precision test-simplepdf-damage
+simplepdf: $(BUILD_DIR)/simplepdf
+$(BUILD_DIR)/simplepdf-resources.c: assets/simplepdf.gresource.xml assets/simplepdf.css assets/simplepdf-page-frame.png | $(BUILD_DIR)
+	"$(GLIB_COMPILE_RESOURCES)" --sourcedir=assets --generate-source --c-name=simplepdf --target="$@" $<
+
+$(BUILD_DIR)/simplepdf: simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'glib-2.0 >= 2.66' evince-view-3.0 evince-document-3.0 || { printf '%s\n' 'Run ./install-simplepdf.sh to install the GTK/Evince dependencies.' >&2; exit 1; }
+	printf '  CC  simplepdf\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) simplepdf.c simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+
+$(BUILD_DIR)/simplepdf-check: tests/simplepdf-check.c simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) tests/simplepdf-check.c simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+test-simplepdf: $(BUILD_DIR)/simplepdf-check
+	# Keep the complete GTK window on-screen at both 1x and 2x for pixel checks.
+	SIMPLEPDF_TEST_CACHE_PRECISION=1 xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-check
+	$(MAKE) --no-print-directory test-simplepdf-damage
+	$(PYTHON) tests/simplepdf-install-check.py
+
+# Rendering regressions also run as part of the normal reader checks.
+test-simplepdf-cache-precision: $(BUILD_DIR)/simplepdf-check
+	SIMPLEPDF_TEST_CACHE_PRECISION=1 xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-check
+
+$(BUILD_DIR)/simplepdf-damage-check: tests/simplepdf-damage-check.c simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) $< simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+test-simplepdf-damage: $(BUILD_DIR)/simplepdf-damage-check
+	xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-damage-check
+
+# Optional Linux diagnostic, not part of the installed application payload.
+$(BUILD_DIR)/simplepdf-render-probe.so: tests/simplepdf-render-probe.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -fPIC -shared $$( $(PKG_CONFIG) --cflags gtk+-3.0 evince-view-3.0 evince-document-3.0 ) $< $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 evince-view-3.0 evince-document-3.0 ) -ldl -o $@

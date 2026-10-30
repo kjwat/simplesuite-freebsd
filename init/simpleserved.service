@@ -1,0 +1,12 @@
+[Unit]
+Description=SimpleServe NFS/SMB sharing and discovery daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/simpleserved
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,227 @@
+# Dependencies
+
+SimpleSuite is intended for Unix-like systems. The default build covers the C
+programs in the repository; the unfinished `dotfrolic` prototype is not part of
+that build.
+
+## Required to build
+
+- A C compiler (`cc`; GCC or Clang) and `make`
+- `pkg-config` (called `pkgconf` on Void Linux)
+- Wide-character ncurses headers and library (`ncurses-devel` on Void)
+- GIO/GLib headers and libraries for removable-volume discovery (`glib-devel` on Void, `libglib2.0-dev` on Debian/Ubuntu)
+- libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
+- OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
+- On Linux, libnm >= 1.24 headers and library for SimpleNet's default combined
+  NetworkManager/standalone build (`libnm-dev` on Debian/Ubuntu,
+  `NetworkManager-devel` on Void). Set `SIMPLENET_WITH_NM=0` for a deliberate
+  standalone-only build; run that binary with `-b wpa`.
+- Avahi client headers and library for native SimpleServe discovery on FreeBSD
+  and Linux (`avahi-libs-devel` on Void; omit when building with
+  `SIMPLESUITE_INSTALL_SIMPLESERVE=0`). macOS uses the system DNS-SD library.
+
+FreeBSD uses GNU Make for this build:
+
+```sh
+sudo pkg install gmake pkgconf ncurses glib curl openssl avahi-app
+```
+
+macOS uses GNU Make plus Homebrew's development libraries. The native
+Objective-C modules link only system frameworks:
+
+```sh
+brew install pkgconf ncurses glib curl openssl@3 make
+```
+
+On macOS, the ordinary `./build.sh` installs missing build and normal runtime
+formulae, then supplies Homebrew's keg-only pkg-config directories
+automatically. Use `SIMPLESUITE_INSTALL_PACKAGES=0 ./build.sh` only when those
+packages were provisioned by a parent installer. The complete build needs the
+macOS 14.2 SDK for SimpleVis's Core Audio tap.
+
+SimpleWords vendors miniaudio only for WAV decoding, one playback device, and
+the small fixed mixer used by its optional five-sample typewriter effect. It
+does not require a separate audio development package or an external player.
+
+On Void Linux:
+
+```sh
+sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel avahi-libs-devel NetworkManager-devel
+```
+
+## Runtime and optional feature dependencies
+
+Simpleterm is a separate opt-in desktop application. Its
+`install-simpleterm.sh` installs GTK 3.24+, VTE 0.76+ for GTK 3, PCRE2,
+development headers, a C compiler, GNU make, pkg-config, fonts, and desktop
+launcher support. These dependencies are not added to the standard suite or
+Scriptorium installer. See [SIMPLETERM.md](SIMPLETERM.md).
+
+No single program needs every item below. Programs without the corresponding
+feature can still be used.
+
+SimpleBrowse v4 has an optional JavaScript mode. On Linux and FreeBSD,
+`simplebrowse --js URL`, `--dump-js`, JS replay form submission, and the `J`
+reload key require Python 3, PyGObject, GTK 3 introspection, and WebKit2GTK 4.1
+introspection/runtime packages. macOS builds a native WKWebView helper, so
+JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
+
+| Command/package | Used by | Purpose | Void package |
+| --- | --- | --- | --- |
+| `simpleplay-core` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `./install-simpleplay.sh` (automatic in Scriptorium) |
+| Python 3, `pactl` | simplevol (Linux) | Mixer control plane; no Python packages needed | `python3 pulseaudio-utils` |
+| Python 3 | simplemail-fetch | Local Gmail delivery and server-copy removal; standard library only | `python3` |
+| Python 3, LibreOffice Writer/Calc, Calibre, Pandoc | simplechange | Local document, spreadsheet, and ebook conversions; Python standard library only | `python3 libreoffice-writer libreoffice-calc calibre pandoc` |
+| DjVuLibre, Poppler | simplechange | DjVu output with embedded text, PDF extraction and validation | `djvulibre poppler-utils` |
+| PipeWire, WirePlumber, LSP LV2 plugins | simplevol effects | Native stereo DSP; all FOSS | `pipewire wireplumber lsp-plugins-lv2` |
+| `links` | simplenews | Default external terminal browser; configurable | `links` |
+| `pdftotext` | simplebook | PDF text extraction | `poppler-utils` |
+| `unzip` | simplebook | Fast EPUB text and contents extraction | `unzip` |
+| `pandoc` | simplebook | Fallback for unusual EPUB packages | `pandoc` |
+| `zip` | simplesave, simplefiles | Date-named backups and ZIP compression | `zip` |
+| `git` | simplever | Repository operations | `git` |
+| `fzf`, `dd`, `sudo` | simpleburn on Linux/FreeBSD/macOS | ISO picker, raw image write, and administrator authentication | `fzf`, base `dd`, `sudo` |
+| `lsblk`, `umount` | simpleburn on Linux | Whole-drive discovery and unmounting | `util-linux` |
+| `libgeom`, `swapinfo`, `umount`, `zpool` | simpleburn on FreeBSD | Native drive, mount, swap, and active ZFS discovery | FreeBSD base system |
+| `diskutil` | simpleburn on macOS | Native drive discovery and unmounting | macOS base system |
+| `libnm` | simplenet with NetworkManager | Native scan, profile selection, and exact-AP activation | `NetworkManager-devel` |
+| accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |
+| `bluetoothctl` plus a running `bluetoothd` | simpleblue on Linux | Scan, securely pair, trust, and connect Bluetooth devices | `bluez` |
+| `pactl`, `parec` | simplevis on Linux/FreeBSD | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
+| `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
+| `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
+| `gio` plus a UDisks-aware GIO volume monitor | simplefiles | Desktop open/trash operations and unmounted removable-volume discovery | `glib` plus GVfs (`gvfs` or `gvfs-backends`; FreeBSD also uses `bsdisks`) |
+| `findmnt` | simplefiles | Exact mount/device validation for `:unmount` on Linux; FreeBSD uses `getmntinfo(3)` | `util-linux` |
+| `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
+| UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
+| `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
+| `libavahi-client`, `avahi-daemon`, `avahi-browse` | simpleserve clients on Linux/FreeBSD | Permanent native mDNS/DNS-SD discovery | Avahi development, daemon, and utility packages listed below |
+| `avahi-publish-service` | simpleserved servers on Linux/FreeBSD | Advertise active shares | Avahi utility packages listed below |
+| Bonjour DNS-SD, `nfsd`, `mount_nfs`, `sharing`, `launchctl` | simpleserve on macOS | Discovery, NFS server/client, native SMB share points, and system service | macOS built-ins |
+| NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
+| Samba server and `testparm` | `simpleserved` server installation on Linux | Managed SMB exports, configuration validation, and service reloads | `samba` (Alpine also uses `samba-server-openrc`) |
+| FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
+| `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
+| `tailscale` (optional) | simpleserve | Encrypted roaming route for the existing direct NFSv3 transport; detected dynamically and never required for LAN use | Platform CLI; macOS also supports the CLI bundled in Tailscale.app |
+| `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
+| Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
+| WKWebView | simplebrowse on macOS | Native JavaScript DOM rendering helper | macOS WebKit framework |
+| Core Audio process taps | simplevis on macOS 14.2+ | Native outgoing system-audio capture | macOS Core Audio framework |
+| `pbcopy`, `pbpaste`, `open`, `diskutil`, `afplay` | macOS integrations | Clipboard, desktop open, removable-volume operations, and reminder audio | macOS built-ins |
+| `zip`, `unzip` | simplefiles | `:compress` and `:extract` commands | `zip`, `unzip` |
+| `ffmpeg` | simplefiles | Broad-format decoding for high-resolution image previews on supported terminals | `ffmpeg` |
+| `nvim`, `vim`, `vi`, or `nano` | simplefiles | External text editing | corresponding editor package |
+| `file`, `less` | user workflows | General terminal helpers; not required by the build | `file`, `less` |
+
+Package names for SimpleBrowse JavaScript mode:
+
+- Debian/Ubuntu: `python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1`
+- Fedora: `python3 python3-gobject webkit2gtk4.1`
+- Arch: `python python-gobject webkit2gtk-4.1`
+- Void: `python3 python3-gobject webkit2gtk`
+- openSUSE: `python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1`
+- Alpine: `python3 py3-gobject3 webkit2gtk-4.1`
+- macOS: no package; the default build supplies the native WKWebView helper
+- FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
+
+SimpleServe client build/runtime packages:
+
+- macOS: none beyond the operating system; Bonjour, NFS mounting, and launchd
+  are built in
+- FreeBSD: `sudo pkg install avahi-app` (the NFS client is in the base system)
+- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-common avahi-daemon avahi-utils cifs-utils`
+- Arch: `sudo pacman -S nfs-utils avahi cifs-utils`
+- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils cifs-utils`
+- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils avahi avahi-openrc avahi-tools cifs-utils`
+- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools cifs-utils`
+- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-client avahi avahi-utils cifs-utils`
+
+Server role additions:
+
+- macOS: none; NFS serving and native SMB sharing are built in
+- FreeBSD: `e2fsprogs` supplies `blkid`; NFS serving is in the base system
+- Debian/Ubuntu and openSUSE: `nfs-kernel-server samba`
+- Arch, Void, and Fedora: `samba` (`nfs-utils` already supplies the server)
+- Alpine/OpenRC: `nfs-utils-openrc samba samba-server-openrc`
+
+On FreeBSD, Linux, and macOS, an interactive `./build.sh` installs and verifies
+the SimpleServe system service through `sudo`; client mode cannot enable NFS or
+SMB exports, and server mode exports nothing until a user explicitly registers
+a share. Noninteractive `auto` mode
+prints the manual `install-simpleserve-system` command instead of hanging for
+a password. Parent installers can select `require` or `skip` with
+`SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM`.
+
+On macOS 14.2 and newer, `simplevis` uses native Core Audio capture and does
+not need `pactl` or `parec`. On every platform it can instead use
+`SIMPLEVIS_CMD` with a command that emits signed 16-bit little-endian mono PCM
+at 44100 Hz.
+
+On Linux and FreeBSD, SimpleFiles first uses the platform's normal read-write
+mount path. Healthy media therefore does not pay for a full filesystem scan.
+If that mount fails, the exact unmounted device is checked, repaired with its
+native tool when dirty, verified, and retried once. Missing or unsupported
+repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
+whose repairs are intentionally more limited than Windows `chkdsk`.
+
+SimpleNet keeps two separate backends: the `nmtui` architecture through `libnm`,
+or a standalone wpa_supplicant instance through its Unix control socket.
+The normal Linux build includes both and requires libnm development files;
+it never silently compiles out NetworkManager support. NetworkManager is
+checked first because it may itself run wpa_supplicant. Select a path with
+`simplenet -b nm` or `simplenet -b wpa`. The combined build refuses direct
+control of a NetworkManager-managed device, including if ownership changes
+while SimpleNet is open.
+
+For a minimalist system, build with `make SIMPLENET_WITH_NM=0 build/simplenet`
+and use `simplenet -b wpa`. That binary needs only ncurses and libc. Its
+explicit backend selection acknowledges that libnm ownership checks are not
+available; use it only with a standalone supplicant.
+
+For standalone wpa_supplicant, the current user needs read/write access to the
+interface socket under `/run/wpa_supplicant` or `/var/run/wpa_supplicant`.
+SimpleNet requests `SAVE_CONFIG` after a successful association; persistence
+therefore requires the daemon configuration to allow updates. Address and
+route assignment remains the job of the system's existing DHCP client or
+network service.
+
+`make test-simplenet` checks the standalone control protocol and, in combined
+builds, runs the real UI/libnm on a private D-Bus fixture. The latter requires
+`dbus-run-session`, Python 3, `python3-dbus`, and `python3-gi`; it does not use
+the host's Wi-Fi interface. Override `PYTHON` if these modules are installed
+only for the system Python. The suite includes a 36-second pending activation.
+
+Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
+feature checklist, not a claim that every listed command is required for every
+SimpleSuite program.
+
+See [MACOS.md](MACOS.md) for the complete macOS install and live-validation
+guide.
+
+## SimplePlay player and shared audio engine
+
+`./install-simpleplay.sh` provisions the full GTK player and its headless
+`simpleplay-core` backend separately from the terminal suite. Use
+`--headless-only` to omit GTK and the desktop launcher. Both use FFmpeg, GLib,
+Cairo, SDL 2, libass, FluidSynth, a General MIDI SoundFont, libsidplayfp and
+JSON-GLib. The build requires C11 and C++17 compilers. The GUI also needs GTK
+3.24+. See [SIMPLEPLAY.md](SIMPLEPLAY.md) for codec checks and the JSON IPC API.
+
+After rebuilding, SimpleFLAC, SimpleRadio and SimplePod prefer the installed
+`/usr/local/bin/simpleplay-core`; SimpleCal and SimpleClock also use it for alarms. Their build
+dependencies remain unchanged. `SIMPLESUITE_AUDIO_PLAYER` can select a
+development engine executable explicitly. Scriptorium installs both applications
+and the engine automatically.
+
+## Unfinished prototype
+
+`unfinished/dotfrolic.cpp` uses SFML. It is retained as source but is not built,
+installed, or supported by the default workflow. Building it manually requires
+a C++ compiler and SFML development files (`SFML-devel` on Void Linux).
+
+SimplePDF is a separately installed GTK application; terminal-only builds do not
+need its libraries. `install-simplepdf.sh` provisions GTK 3.24+, GLib 2.66+ and
+Evince's 3.0 document/view API (`libevince-dev` and `poppler-data` on Debian 13).
+The runtime PDF backend is supplied by libevdocument. Full desktop builds and
+Simpleupdate install these dependencies before compiling. SimpleBook's existing
+Poppler command-line, unzip and bundled libmobi dependencies remain separate.

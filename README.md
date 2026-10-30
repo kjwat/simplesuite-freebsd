@@ -1,0 +1,1671 @@
+# SimpleSuite
+
+FreeBSD upstream: https://github.com/kjwat/simplesuite-freebsd. The complete native desktop port is in progress; hardware, full application runtime, and typography acceptance are not yet complete.
+
+SimpleSuite is a collection of lightweight terminal applications written in C
+and ncurses. It is meant to provide a complete local-first workspace without a
+database or desktop shell dependency.
+
+## Applications
+
+| Program | Purpose |
+| --- | --- |
+| `simplefiles` | File manager |
+| `simpleburn` | Find an ISO with fzf and write it to a selected drive with dd |
+| `simplechange` | Batch document and ebook conversion with a searchable format picker |
+| `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
+| `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
+| `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
+| `simplemail` | Local Maildir mail client |
+| `simplesearch` | Live phrase search through file contents in `~/writing`; Enter opens SimpleWords |
+| `simplewords` | Text editor / word processor |
+| `simplenote` | Blank-page notes and a journal browser |
+| `simplecal` | Offline calendar and reminder app |
+| `simpleclock` | Clock, stopwatch, timer, and alarm |
+| `simpleflac` | Local audio player |
+| `simpleradio` | Internet radio player |
+| `simplepod` | Podcast search, episode browser, and player |
+| `simplenews` | RSS and Atom reader |
+| `simplebrowse` | Text-mode HTTP/HTTPS web browser |
+| `simplebook` | Terminal PDF/EPUB/MOBI reader (`book` in Scriptorium) |
+| `simplepdf` | Native GTK PDF reader with pinch zoom (`pdf`; separate installer / full desktop build) |
+| `simplevis` | Audio visualizer |
+| `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
+| `simplestats` | System monitor |
+| `simplever` | Git frontend |
+| `simplesave` | Date-named ZIP backups of writing, scriptorium, simplesuite, and optional website/simplewm |
+| `simplegame` | Small terminal arcade game |
+
+## Installation
+
+For the standalone document/ebook converter, see [SIMPLECHANGE.md](SIMPLECHANGE.md).
+Build it with `make build/simplechange`, or install it and its conversion engines
+with `./install-simplechange.sh`. It follows the suite's C/ncurses interface.
+
+The optional GTK terminal, **Simpleterm**, has its own installer:
+`./install-simpleterm.sh`. It installs its dependencies and
+`/usr/local/bin/simpleterm`. Scriptorium also runs this installer automatically.
+It supports Linux, macOS through Homebrew, and FreeBSD through `pkg`/`gmake`;
+macOS also gets a Finder launcher in `/Applications`.
+See [SIMPLETERM.md](SIMPLETERM.md) for behavior, shortcuts, and removal.
+
+The GTK media player and shared audio engine, **SimplePlay**, have their own installer:
+`./install-simpleplay.sh`. It uses the full installed FFmpeg codec set plus native
+MIDI/SID synthesis, with a queue, subtitles, track selection, chapters, and
+remembered playback positions. `simpleplay-core` runs without GTK or a display
+and exposes JSON IPC for SimpleFLAC, SimpleRadio, SimplePod, SimpleCal, SimpleClock and other
+frontends. Use `--headless-only` for a server installation. Build it with
+`make simpleplay`. Scriptorium installs both player executables automatically.
+See [SIMPLEPLAY.md](SIMPLEPLAY.md).
+
+SimpleVol's controls, optional background service, audio tests, and FOSS plugin
+packaging requirements are documented in [SIMPLEVOL.md](SIMPLEVOL.md).
+
+```sh
+git clone https://github.com/kjwat/simplesuite-freebsd.git ~/simplesuite
+cd ~/simplesuite
+./checkdeps.sh
+./build.sh
+```
+
+On macOS, that same `./build.sh` command detects Darwin, verifies macOS and the
+selected SDK, installs any missing Homebrew dependencies, selects `gmake`, and
+builds the native Apple implementation. Homebrew itself and Apple's Command
+Line Tools must already be installed. Include optional convenience tools with:
+
+```sh
+./build.sh --with-extras
+```
+
+`install-macos.sh` remains as a compatibility alias for `build.sh`. Set
+`SIMPLESUITE_INSTALL_PACKAGES=0` when a parent provisioner has already installed
+the macOS packages.
+
+See [MACOS.md](MACOS.md) for the native integrations, permission prompts, and
+validation commands.
+
+Before installing, `build.sh` requires the SimpleWords release gate: the full
+test suite, warning-clean builds, ASan/UBSan, persistence fault injection,
+state/differential stress, real-PTY runs, and destructive-path coverage. The
+independent builds then run concurrently (up to eight jobs) and install the
+programs into `/usr/local/bin` and shared audio assets into:
+
+```text
+/usr/local/share/simplesuite/simplecal-alarm.mp3
+/usr/local/share/simplesuite/simplewords-typewriter.wav
+/usr/local/share/simplesuite/simplewords-typewriter-alt.wav
+/usr/local/share/simplesuite/simplewords-typewriter-space.wav
+/usr/local/share/simplesuite/simplewords-typewriter-enter.wav
+/usr/local/share/simplesuite/simplewords-typewriter-delete.wav
+```
+
+Installers reject live destinations under `~/.local`. Administrator
+authentication is required for protected system directories; failure never
+falls back to a user-local installation. A verified system install removes
+older user-local copies of the same programs and helpers.
+
+`simplewords --version` reports the exact source commit (and appends `-dirty`
+for a development worktree). The same revision is recorded in
+`/usr/local/share/simplesuite/install-manifest`, so a captured system image can be
+traced back to the code that passed its gate.
+
+It also installs `simplesuite-uninstall` and creates SimpleNews example files
+plus SimpleFiles, SimpleMail, and SimpleWords config files if they do not
+already exist. Existing user config files are left intact. SimpleWords sound
+remains off by default; volume `70` is the recommended level when it is
+enabled.
+
+`make install` and `./build.sh` default to `PREFIX=/usr/local`. Compilation
+runs as your user; installation requests sudo only when the destination needs
+administrator privileges. A successful default install removes older suite
+executables from `~/.local/bin`. Explicit `PREFIX`, `BINDIR`, `SIMPLESUITE_DATADIR`,
+and `DESTDIR` overrides remain available for custom and staged installations.
+Shared audio is resolved beside the installed executable or in the system
+share directory; `SIMPLESUITE_DATADIR` can also override audio lookup at runtime.
+
+For the complete desktop suite, including Simpleterm and SimplePlay, use
+`make full` followed by `make install-full` (with `DESTDIR` for staging).
+SimpleOS updates and image builds use this interface, so application packaging
+stays in the suite itself. New applications belong in the normal build/install
+payload; simpleupdate discovers its contents automatically and enrolls new
+files with backups. No separate updater program list needs to be maintained.
+
+Installed executables use their full `simple*` names. Scriptorium writes short
+commands such as `alias words='simplewords'` into `~/.bashrc` (and the other
+supported shell configuration files). Standalone users can add these aliases to
+their shell configuration using the installed `command-abbreviations` manifest,
+which is generated from the platform-aware `program-manifest.sh`. Install and
+uninstall remove legacy short-name symlinks that still point to their managed
+target; unrelated commands are preserved. No short-name executable files or
+symlinks are created in the bin directory.
+
+On FreeBSD, Linux, and macOS, an interactive `build.sh` also installs, enables,
+starts, and verifies the privileged SimpleServe service through `sudo`. Set
+`SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=require` when an unattended parent
+installer must fail unless that service is ready, or `skip` when deliberately
+managing it separately. Set `SIMPLESUITE_INSTALL_SIMPLESERVE=0` to skip building
+or updating SimpleServe; the default is `1`. Skipping is non-destructive: an
+existing user installation, system service, exports, and managed Linux fstab
+block are left untouched. Use the explicit SimpleServe or whole-suite
+uninstaller when removal is intended. Staged `DESTDIR` builds never modify the
+host service. Direct SimpleSuite builds preserve an existing valid role and
+otherwise use the safe `client` default. Set
+`SIMPLESUITE_NETWORK_ROLE=server` only for an intentional publishing-host
+promotion, or `none` to skip SimpleServe. `client` builds and installs
+SimpleServe without publishing capability, while `none` is equivalent to
+skipping it.
+
+Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
+build:
+
+```sh
+SIMPLESUITE_JOBS=4 ./build.sh
+```
+
+The normal build prints one short `CC` line per program. To run the stricter
+warning audit used by the project:
+
+```sh
+make check-warnings
+```
+
+On FreeBSD, install `gmake` and the dependencies listed in `DEPENDENCIES.md`.
+On macOS, `build.sh` installs missing Homebrew formulae automatically; on both
+systems it selects `gmake`. SimpleFiles uses
+native platform storage APIs on macOS and the native mount table for validated
+unmounts on FreeBSD. SimpleStats likewise uses native Apple frameworks on
+macOS and native FreeBSD interfaces on FreeBSD.
+
+If commands such as `simplewords` are not found after installation, add
+`/usr/local/bin` to your PATH:
+
+```sh
+echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+For zsh:
+
+```sh
+echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+## Uninstallation
+
+From the source checkout, remove the complete installed suite with:
+
+```sh
+./uninstall.sh
+```
+
+The installer also puts `simplesuite-uninstall` on `PATH`, so uninstallation
+still works after the source checkout has been removed:
+
+```sh
+simplesuite-uninstall
+```
+
+The normal uninstall removes every SimpleSuite executable, runtime helper,
+shared audio asset, SimpleCal/SimpleClock background reminder hook, and the
+matching SimpleServe system service. It withdraws SimpleServe's managed NFS
+exports and managed Linux Samba or macOS SMB shares while preserving its share
+configuration and remembered mounts for a future reinstall. It also preserves user configuration,
+caches, state, notes, calendars, Maildirs, SimpleFiles trash, downloads, and the
+source checkout.
+Preview the operation or also remove application and SimpleServe system
+settings, caches, and transient state with:
+
+```sh
+./uninstall.sh --dry-run
+./uninstall.sh --purge
+```
+
+Even `--purge` deliberately preserves personal content: notes, calendar data,
+Maildirs, SimpleFiles trash, downloads, and source files.
+
+For complete removal, including configuration, caches, recovery state,
+notes under `~/writing/notes`, calendar data, SimpleMail Maildirs, SimpleFiles
+trash, installed assets, and the recorded SimpleSuite source checkout, use the
+deliberately destructive burn mode:
+
+```sh
+./uninstall.sh --burn
+```
+
+It requires typing `BURN` exactly. For a noninteractive disposable/test
+installation, `--burn --yes` supplies that confirmation. `--dry-run --burn`
+previews the same scope without deleting anything. Burn removes everything it
+can identify as SimpleSuite-owned; it does not remove shared system packages
+or unrelated documents in general-purpose directories such as `~/Downloads`.
+
+See [DEPENDENCIES.md](DEPENDENCIES.md) for required build packages and optional
+runtime features.
+
+## SimpleServe
+
+SimpleServe discovers Unix shares with mDNS and mounts them through the
+kernel's NFS client. On Linux and macOS, every active local share is also
+exported through the platform SMB server without changing the CLI. It does not
+create a private file-browser abstraction: a successful mount is a normal VFS directory usable
+by `ls`, SimpleWords, SimpleFlac, SimplePlay, and every other local program.
+
+The installed role is an explicit security boundary in
+`/etc/simpleserve-role`. A `client` can discover, mount, and remember remote
+shares but cannot publish one: the daemon rejects `share` and `unshare`, opens
+no manifest listener, creates no NFS/SMB export, and starts no publisher. A
+`server` can both publish and mount. For compatibility, a daemon launched from
+a pre-role installation still treats a missing role file as server mode, but
+current installers always create the file: they preserve an existing role and
+otherwise choose client.
+Tailscale never changes a role; when its CLI is installed and active it simply
+adds a second route for the same NFS shares. SimpleServe has no mandatory
+runtime dependency on Tailscale.
+
+On FreeBSD, Linux, and macOS, the ordinary interactive build installs the
+`simpleserve` client and automatically installs `simpleserved` as a root system service. If
+the automatic step was intentionally skipped, the equivalent manual command
+is:
+
+```sh
+# FreeBSD client
+sudo env SIMPLESUITE_NETWORK_ROLE=client gmake install-simpleserve-system
+
+# Linux client (GNU make)
+sudo env SIMPLESUITE_NETWORK_ROLE=client make install-simpleserve-system
+
+# macOS client
+sudo env SIMPLESUITE_NETWORK_ROLE=client gmake install-simpleserve-system
+```
+
+Use `server` instead of `client` only on a publishing host. Reinstalling the
+same role is content-aware and does not rewrite the role, daemon, or service
+definition or restart a healthy service. Changing roles replaces the one-line
+role file and restarts the daemon so promotion or demotion takes effect.
+
+The installer supports FreeBSD rc.d, Linux systemd/OpenRC/runit, and a macOS
+LaunchDaemon. A Void client enables only packaged `dbus` and `avahi-daemon`;
+a server additionally enables `rpcbind`, `statd`, `nfs-server`, and `smbd`.
+It installs
+`/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
+the service, starts it, and verifies the installed bytes, protocol runtime
+components, live service state, and control socket. Avahi starts with the daemon
+on FreeBSD/Linux; macOS uses the system Bonjour service. NFS and the platform
+SMB server are enabled when SimpleServe first needs them. Installation reports
+whether the optional Tailscale transport is
+active, inactive, or unavailable, but succeeds normally in every case. If the
+installed bytes, metadata, and service definition already match and the daemon
+is healthy, a rerun neither replaces them nor restarts the service.
+
+`simpleserved` checks `tailscale ip -4` at startup and periodically thereafter,
+using `tailscale status --json` sparingly for state and local MagicDNS identity.
+It distinguishes a missing CLI, an unavailable daemon, an unauthenticated
+daemon, and an active tailnet. Install or activate Tailscale later and the
+running daemon will notice without a SimpleServe reinstall. To force an
+immediate refresh of local state, remembered peer coordinates, and exports,
+run:
+
+```sh
+simpleserve configure
+# Equivalent spelling:
+simpleserve refresh
+```
+
+Discovery, mount, and reconnect operations also refresh the relevant state.
+On macOS it recognizes both the standalone `/usr/local/bin/tailscale` launcher
+and the CLI bundled in `/Applications/Tailscale.app`, and forces the bundled
+app into noninteractive CLI mode for service calls.
+
+Register the root of a currently mounted local filesystem on the server:
+
+```sh
+simpleserve share /media/T7
+simpleserve share /media/Music --read-only
+```
+
+SimpleServe records the filesystem UUID, not just the transient directory
+name. It refuses ordinary leftover directories, autofs placeholders, NFS
+re-exports, read-only filesystems requested as writable, and paths the caller
+cannot access. If the drive disappears or the mount identity changes, the NFS
+and SMB exports and mDNS availability are withdrawn; the empty mountpoint is
+never exported in its place.
+
+Every active NFS share keeps the existing automatically detected or explicitly
+configured LAN allowances. While Tailscale is active, the same dynamic export
+also allows the Tailscale IPv4 network (`100.64.0.0/10`) with the identical
+read/write and ownership-mapping policy. The network constant is transport
+policy; no machine address, LAN subnet, username, or share name is built into
+SimpleServe. Stopping or logging out of Tailscale withdraws that additional
+allowance while leaving LAN exports intact.
+
+Linux exports accept NFS requests from non-reserved source ports so phone and
+tablet NFS applications work on both the trusted LAN and Tailscale. This does
+not open a public port or broaden the allowed client networks, and every NFS
+identity remains mapped through the share owner's existing `all_squash`
+policy. Never forward NFS, RPC, SimpleServe, or SMB ports through the public
+router; remote phone access belongs on the encrypted Tailscale route.
+
+Linux SMB shares live in the generated `/etc/samba/simpleserve.conf` include.
+SimpleServe adds only a marked include registration to `/etc/samba/smb.conf`,
+leaving unrelated global settings and user-created shares intact. Every
+candidate configuration is checked with `testparm` before activation. A failed
+validation or Samba reload restores the previous include and `smb.conf`.
+Read-only/read-write access and forced Unix user/group ownership match the NFS
+export, while guest access keeps shares usable on the same trusted LAN without
+creating Samba passwords. The same SMB listener is reachable through the
+server's Tailscale address, so phone clients can use SMB on either route without
+a second export definition.
+
+On macOS, SimpleServe creates equally named SMB share points with Apple's
+built-in `sharing` tool and reconciles only records prefixed with
+`SimpleServe-`. Its private ownership record lives at
+`/var/db/simpleserve/smb-shares.conf`, so unplugged volumes and uninstalls
+withdraw only SimpleServe-managed share points. No Samba package or
+configuration file is used.
+
+On Linux, registering a UUID-backed filesystem also adds it to a clearly
+marked SimpleServe block in `/etc/fstab`. The generated entry uses `nofail`, so
+an unplugged drive cannot hold up boot, and the daemon keeps the entry while
+the drive is temporarily absent. `simpleserve unshare NAME`, the normal system
+uninstaller, and purge all remove the corresponding managed entry or block
+without changing unrelated fstab mounts. The uninstallers also remove the
+managed Samba include and its marked registration without changing unrelated
+Samba configuration. Starting or reinstalling the service reconciles both
+export protocols from `/etc/simpleserve.conf`.
+
+On a client:
+
+```sh
+simpleserve connect
+simpleserve discover
+simpleserve mount thetyper:T7
+simpleserve mount thetyper:Music --remember
+```
+
+`simpleserve connect` is the first-run shortcut. With one discovered share it
+asks for confirmation; with several it offers a numbered list. The selected
+share is mounted and remembered. `simpleserve connect SERVER:SHARE` provides
+the same remembered mount for an already known peer.
+
+Mounts use this fixed layout:
+
+```text
+~/SimpleServe/
+└── thetyper/
+    ├── T7/
+    └── Music/
+```
+
+`--remember` reconnects the mount after daemon or network restarts. When a
+server vanishes, the daemon marks the mount unavailable and checks for a
+reachable alternate route. After three failed maintenance checks, it releases
+an offline managed mount even when no alternate is available. Remembered
+connection details remain, and the same share reconnects when its endpoint
+returns. Explicit `simpleserve unmount PEER:SHARE` also disconnects an offline
+busy share and removes its remembered connection.
+The empty mountpoint is removed while offline, so a new save cannot silently
+write into a local directory under the disconnected share's name.
+
+The SimpleServe peer and share names are persistent identities. Remembered
+records may additionally cache a hostname, Tailscale/MagicDNS name, current LAN
+address, current Tailscale IPv4, manifest port, export path, and access mode.
+Those coordinates are optional and refreshable. Before a remembered Tailscale
+route is mounted, SimpleServe asks `tailscale ip -4 PEER` for its current
+address. An active server supplies its current MagicDNS name and IPv4 in
+optional HTTP manifest headers, which older clients can ignore; the peer name
+and share remain the identity. Old records containing only peer, share, and
+filesystem identity still load and are enriched automatically the next time
+LAN discovery sees the peer. The last selected route/source is also optional
+recovery metadata, not identity.
+
+Mount selection probes TCP rpcbind and NFS briefly instead of relying on ping. A usable
+LAN endpoint is tried first; a usable Tailscale endpoint is the fallback. Both
+sources always mount at `~/SimpleServe/PEER/SHARE`, and `simpleserve status`
+shows the route and address actually in use. For every remembered mount it
+also refreshes the peer's tailnet coordinates and reports whether the NFS/RPC
+endpoint is `ready`, `unreachable`, `transport inactive`, or `not configured`.
+The worker checks both TCP rpcbind (111) and NFS (2049), including while the
+mount uses LAN, and caches the results for 15 seconds. `simpleserve refresh`
+forces a fresh check; duplicate shares on one endpoint reuse a single probe.
+Status reads do not wait for network probes. Before a result is available,
+status reports `not checked`, which SimpleTrident treats as `UNKNOWN`.
+These checks verify endpoint reachability; mounting still verifies access to
+the selected export. Reissuing the same `simpleserve mount PEER:SHARE` command
+is an explicit reconnect: it uses a normal unmount before moving a healthy
+Tailscale mount back to a now-usable LAN. If the current route goes stale, the bounded
+normal-unmount/reconnect lifecycle selects the best route again. The daemon
+checks active routes every two seconds and tries a reachable fallback on the
+first failed check. On Linux, a busy or timed-out stale managed mount can be
+lazily detached after rechecking that its NFS endpoint is unavailable, including
+when all routes are down; pending references are not forcibly aborted. An
+already mounted share stays usable if NFS is healthy even when rpcbind alone
+is down. When LAN returns, the daemon tries a normal unmount
+to restore LAN preference, retaining a healthy busy Tailscale mount and
+retrying later if it cannot be released.
+
+Linux client mounts exclude remote Trash from the desktop's automatic scan
+with `x-gvfs-notrash`. This prevents an offline server from pinning the shared
+Trash service and delaying unrelated file choosers. Local Trash remains
+available; SimpleFiles can explicitly move remote files to their per-filesystem
+Trash. Mounts retain normal hard NFS write semantics.
+
+On Linux, SimpleFiles reads SimpleServe directories, display metadata, and
+previews in background workers. Its interface keeps a local working directory
+and retries reads when the mount changes, so an unfinished read against a
+detached LAN mount does not prevent browsing through the Tailscale replacement.
+Old reads are allowed to finish, and their results are discarded after a mount
+change.
+
+FreeBSD NFSv3 clients use `READDIRPLUS` and four-block read-ahead so large
+directory listings avoid per-entry metadata round trips and sequential reads
+can keep multiple requests in flight.
+macOS clients use Apple's `mount_nfs` in NFSv3/TCP mode with `READDIRPLUS` and
+16-block read-ahead.
+
+The useful acceptance test is deliberately outside SimpleServe itself:
+
+```sh
+mount | grep SimpleServe
+df -h ~/SimpleServe/thetyper/T7
+ls ~/SimpleServe/thetyper/T7
+cp poem.txt ~/SimpleServe/thetyper/T7/
+simpleplay ~/SimpleServe/thetyper/T7/movie.mkv
+```
+
+Discovery advertises `_simpleserve._tcp.local` and retrieves a versioned share
+manifest on TCP port 7337; NFSv3 over TCP carries file data. Exports are
+limited to active private IPv4 LANs plus the Tailscale IPv4 network when that
+transport is active. All remote credentials are mapped to the local user who
+registered the share, so matching numeric UIDs across FreeBSD, Linux, and macOS
+are not required. NFSv3 AUTH_SYS itself is not encrypted and must never be exposed to
+untrusted Wi-Fi or the public internet; the remote route relies on Tailscale's
+encrypted, access-controlled network rather than exposing NFS publicly.
+
+`simpleserved` owns one native DNS-SD browser for its full lifetime: Avahi on
+FreeBSD/Linux and Bonjour on macOS. Add/remove events continuously update an
+in-memory server/share cache, and
+manifest retrieval happens outside the command path. `simpleserve discover`
+reads that warm cache immediately; `simpleserve mount` uses the same cached
+endpoint and requests a fresh resolve only after a cache miss or failed mount.
+
+Server configuration lives at `/etc/simpleserve.conf`. Remembered client
+mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and macOS, and
+`/var/lib/simpleserve/mounts.conf` on Linux. Optional endpoint metadata is kept
+in that existing mount record format; there is no peer database or migration
+step. SimpleFiles has not been changed; it treats `~/SimpleServe` like any
+other directory because these are already real mounts.
+
+## Notes
+
+- The default build installs all programs listed above.
+- `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
+- `simplebrowse` v4 defaults to a fast automatic path: it fetches ordinary
+  pages directly with reusable HTTP connections and starts
+  `simplebrowse-webkitd` only for known browser-only sites or detected
+  JavaScript shells. The helper uses native WKWebView on macOS and WebKitGTK
+  elsewhere. You can still force either backend.
+- SimpleBrowse preserves search forms when possible. For DuckDuckGo,
+  Wikimedia sister sites, and Project Gutenberg, it recreates search forms
+  when static reader extraction would otherwise omit them. The WebKitGTK
+  path preserves the visible interface and activates live controls with native
+  form ownership, validation, and JavaScript events. The
+  [compatibility matrix](SIMPLEBROWSE-COMPATIBILITY.md) records tested behavior,
+  public-site results, and remaining gaps.
+- Pressing Enter on a direct audio, video, image, PDF, or EPUB link downloads
+  it to the browser cache and opens it with the system MIME application.
+- Shift-Enter on a direct file link opens an editable Save As path in the
+  footer, defaulting to the original filename under `~/Downloads`.
+- Audio programs require `simpleplay-core` for playback. Scriptorium installs it
+  with SimplePlay; standalone users run `./install-simpleplay.sh`.
+- `simplecal` and `simpleclock` play the installed alarm MP3 through
+  `simpleplay-core`, with emergency platform players where supported.
+- On FreeBSD, `simplefiles` uses the privileged
+  `simplefiles-freebsd-unmount` helper for root-owned `/media` mounts and
+  unmounts.
+  `./build.sh` installs it with sudo during interactive installs. Set
+  `SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip` to skip that step, or `require`
+  to fail the install if the privileged helper cannot be installed. The helper
+  is executable only by `operator`, requires the caller to have raw-device read
+  access, accepts an exact validated media path/device pair, and mounts through
+  the native media map with `rw`, `nosuid`, `noatime`, and `automounted`.
+  The normal autofs mount is attempted first, so healthy media avoids a full
+  filesystem scan. If that attempt fails, the helper checks the unmounted
+  filesystem with a fixed, root-owned native checker; dirty filesystems receive
+  one noninteractive repair, verification, and mount retry. It has no read-only
+  retry, rejects any mount that is still read-only, and leaves media unmounted
+  when recovery tooling is missing or repair fails.
+  It verifies that the kernel retained the persistent safety flags (updating
+  FUSE mounts when necessary), verifies its root-owned executables, gives every
+  privileged child a fixed safe environment, and bounds external-command waits.
+  The normal uninstaller removes the global helper too, requesting sudo when
+  needed; it reports an incomplete uninstall instead of silently leaving the
+  helper behind.
+- On Linux, `simplefiles` starts with the normal GIO mount. Only a failed mount
+  starts UDisks2 `Check`; a dirty filesystem runs `Repair`, another `Check`,
+  and one mount retry. Unsupported filesystems, unavailable repair tools,
+  failed repairs, device changes, and drives mounted during recovery remain
+  blocked instead of falling back to read-only. On every GIO platform,
+  SimpleFiles verifies the completed mount and rolls it back if it is read-only
+  or its writable state cannot be established.
+- On macOS, `simplefiles` discovers removable volumes through Disk Arbitration
+  and IOKit, presents them under `/Volumes`, mounts and unmounts with
+  `diskutil`, opens files with `open`, and sends deletions through Finder's
+  native Trash API.
+- SimpleWords plays its optional typewriter-key sound in-process; it does not
+  need an external player, and the feature is disabled by default.
+- `simplebook` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
+  extracted in bounded parallel page ranges on multicore systems, then merged
+  in source order before caching. It runs `pdftohtml` as a bounded background
+  job only when PDF link navigation is needed. EPUBs are streamed from their
+  ordered XHTML spine with `unzip`, retaining internal anchors and destinations
+  in the private text cache; `pandoc` remains a compatibility fallback.
+  MOBI, AZW and AZW3 books use the bundled `simplebook-mobi` helper to create a
+  private cached EPUB and then follow the same reading and navigation path.
+  The helper builds from vendored [libmobi](third_party/libmobi/UPSTREAM.md),
+  using its internal ZIP and XML implementations without extra packages or
+  network downloads. Normal install and uninstall manage the helper; `--purge`
+  also removes the converted EPUBs and text cache.
+- `simplefiles` configuration options are documented in
+  `simplefiles-config.example`.
+- `simplenet` lists visible Wi-Fi networks, asks for a password when needed,
+  and connects or disconnects. Activating the connected row disconnects the
+  adapter and suspends automatic connections until the next manual connection,
+  while preserving saved profiles and passwords.
+  Its NetworkManager backend follows `nmtui-connect`'s
+  architecture: live `NMClient` objects, libnm device/AP compatibility checks,
+  `ActivateConnection` for saved profiles, and `AddAndActivateConnection` with
+  an empty template for new networks. NetworkManager fills and saves the
+  profile, selects security, and controls addressing, routing, and roaming.
+  An activation-scoped `NMSecretAgentOld` subclass handles missing or rejected
+  passwords, WEP keys, and configured 802.1X credentials through NetworkManager's
+  secret requests. Connection completion comes from active-connection and
+  device state; there is no independent 35-second activation cutoff.
+  SSID display text is never used as profile identity. The UI keeps individual
+  access points visible, preserves selection across refreshes, and follows
+  disconnects and roaming without waiting for another scan. Enterprise
+  enrollment and full profile editing remain available through `nmtui edit`.
+  Passwords are masked and never placed in process arguments or temporary files.
+  Navigation, paging, rescanning, and quitting remain available while agent
+  registration, connection, or disconnection is pending. Only credential
+  entry opens a modal prompt.
+- Standalone wpa_supplicant is a separate backend for systems that do not use
+  NetworkManager. `simplenet -b nm` and `simplenet -b wpa` select a backend;
+  `-i interface` selects an adapter. Auto mode prefers a running NetworkManager
+  and falls back only after establishing that it is absent. The combined build
+  refuses direct control of a NetworkManager-managed interface. Standalone
+  profiles are reused when compatible; other saved profiles are never deleted
+  to replace a same-SSID connection. `SAVE_CONFIG` determines persistence;
+  SimpleNet reports session-only connections when saving is unavailable. This
+  backend handles Wi-Fi association; the system's DHCP/network service must
+  provide addresses and routes. Socket replies and scan waits service keyboard
+  input; a rescan requested during an operation runs after it finishes.
+- Linux builds include both backends and require `libnm >= 1.24` development
+  files (`libnm-dev` on Debian/Ubuntu). A minimalist build is explicit:
+  `make SIMPLENET_WITH_NM=0 build/simplenet`, then `simplenet -b wpa`.
+  It requires only ncurses and an accessible standalone control socket, with
+  no NetworkManager, GLib, `nmcli`, `wpa_cli`, or `iw` dependency.
+- On Linux, `simpleblue` provides the matching Bluetooth panel through BlueZ's
+  `bluetoothctl`. It scans nearby and remembered devices, pairs with the secure
+  BlueZ agent (including PIN and numeric-confirmation flows), connects and
+  disconnects, manages trust/block state, forgets saved pairings, and toggles
+  adapter power. Discovery stays active while the panel is open, so nearby
+  devices and names resolved later appear before pairing. Like GNOME's setup
+  panel, the computer is discoverable during this session, and anonymous
+  discoveries stay out of the default device list until a name is available.
+  Discovery stops when the panel closes or Bluetooth is powered off.
+- BlueZ is optional and is not installed merely because SimpleSuite is
+  installed. If BlueZ, its service, or a Bluetooth controller is unavailable,
+  `simpleblue` exits before starting ncurses, explains what is missing, and
+  prints opt-in setup commands tailored to the detected Linux distribution and
+  init system. Run `simpleblue --setup-help` to show those commands at any time.
+- On macOS 14.2 and newer, `simplevis` captures outgoing system audio through
+  a native Core Audio process tap. It does not require PulseAudio. macOS asks
+  for System Audio Recording permission on first use.
+- On macOS, SimpleCal and SimpleClock install per-user launchd agents for
+  persistent reminder checks; the normal SimpleSuite uninstaller unloads and
+  removes both agents.
+- `simplemail` reads local Maildir folders and uses configured external
+  commands, normally `mbsync` for mail sync and `msmtp` for sending.
+- `simplenews` defaults to `links %u` as its external browser command.
+- Most tools store data under `~/.config`, `~/.local/share`,
+  `~/.local/state`, or `~/.cache`.
+
+<p align="center">
+  <img src="screenshots/simplebrowse.png" width="45%">
+  <img src="screenshots/simplefiles.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplemail.png" width="45%">
+  <img src="screenshots/simplewords.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplecal.png" width="45%">
+  <img src="screenshots/simpleradio.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simpleflac.png" width="45%">
+  <img src="screenshots/simplepod.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplenews.png" width="45%">
+  <img src="screenshots/simplebook.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplevis-white.png" width="45%">
+  <img src="screenshots/simplevis-green.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simpleclock.png" width="45%">
+  <img src="screenshots/simplestats.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplever.png" width="45%">
+</p>
+
+## Keybindings
+
+### simplefiles
+
+- Arrows or `hjkl`: move; `l`, Right, or Enter opens; `h` or Left goes up.
+- Page Up/Page Down: jump through the list.
+- `Space`: toggle selection and advance.
+- `v`: select all / clear all toggle; `V`: invert selection.
+- `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
+- Paste, trash/delete, compression, extraction, empty-trash, and unmount
+  operations run in the background; the status bar reports progress or
+  completion.
+- `cw`: rename current entry; `a`: make directory.
+- `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
+- `i`: toggle the right pane between preview and item information. Directory
+  file, subdirectory, and byte totals are calculated in the background.
+- `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
+
+### simplenet
+
+- Arrows or `j`/`k`: choose a network; Enter connects or disconnects the connected network.
+- PageUp/PageDown: move ten rows, including while a connection is pending.
+- Click a network row to connect or disconnect it.
+- `r`: rescan.
+- Esc: cancel the masked password prompt.
+- Esc while NetworkManager is connecting or disconnecting: stop waiting;
+  NetworkManager may continue the pending operation.
+- `q`: quit.
+
+### simplevol
+
+- Playback includes **System Sounds**, the saved notification/event volume,
+  even when no notification is playing. Left/Right adjusts it, Space mutes it,
+  and Enter sets an exact volume. It uses the audio server's stream-restore
+  extension and preserves other saved application volumes and output choices.
+- See [SIMPLEVOL.md](SIMPLEVOL.md) for the mixer, routing, and effects controls.
+
+### simpleblue
+
+- Arrows or `j`/`k`: choose a device; Enter pairs/connects or disconnects.
+- `r`: refresh nearby devices; discovery continues while the panel is open.
+- `u`: show/hide unnamed discoveries. Saved and connected devices always stay
+  accessible, even when their name is unavailable.
+- `t`: trust/untrust; `b`: block/unblock; `x`: forget a saved pairing.
+- `p`: toggle adapter power; `?`: help; `q`: quit.
+- During first-time pairing, follow the BlueZ prompt to enter a PIN, confirm
+  matching codes, or type the displayed passkey on the remote device. Pairing
+  returns as soon as BlueZ completes; routine discovery events stay hidden.
+  Device details and names update during discovery before pairing. Supported
+  device-name advertisements are also read when BlueZ has no name, including
+  Motorola's advertised model name. Saved names and aliases take precedence.
+  Devices that do not provide a name remain in the optional unnamed view, with
+  manufacturer hints when available; a hint does not identify the device's
+  model or owner. Counts update as devices appear or disappear and as names
+  become available.
+
+### simplemail
+
+- Arrows: move; Page Up/Page Down: jump through the message list.
+- Enter opens a thread or message; Backspace returns from read/thread views.
+- `m`: open mailbox chooser; `m` or Esc closes it.
+- Mailboxes are Inbox, Sent, Drafts, Archive, and Trash by default.
+- `c`: compose new message; sending continues in the background after review.
+- `r`: reply to the current message.
+- `p` or `P`: run the configured sync command in the background.
+- `Space`: toggle selection and advance.
+- `v`: select all messages; `V`: invert selection; Esc clears selection.
+- `a`: archive the current message or selection.
+- `dD`: start delete/trash confirmation; `y` confirms.
+- `u`: restore from Trash or Archive.
+- `o`: open attachment; `s`: save attachment.
+- `/`: search; `n`/`N`: next/previous match.
+- `q`: confirm and quit.
+
+### simplenote
+
+`simplenote` starts on a blank ncurses page. Type a note and press **Ctrl-X
+Ctrl-S** to save and open the journal browser: years on the left, dated note
+previews in the middle, and the selected note on the right. It uses the shared
+SimpleWords-derived renderer with normal prose attributes, an 80-column writing
+area, Unicode-aware soft wrapping, and changes-only cell redraws. Its writing
+surface shares SimpleWords' wrapping and cursor movement code, including
+visual-row Home/End, Shift-arrow and Shift-Page selection, and cursor placement
+at soft wraps. **F1** shows
+the keys. `simplenote --browse` opens the browser directly; `note` is the short
+shell alias installed by Scriptorium.
+
+Notes autosave after one second of idle time or five seconds of continuous
+typing. A separate `.draft` recovery file is saved after a quarter-second pause
+or two seconds of continuous typing and reopened after an interrupted session.
+It retains the original version while editing an older note, including when
+restoring that version fails during discard.
+**Esc** or **Ctrl-X Ctrl-C** discards the writing session and opens the browser:
+a new note is removed, including any autosave, and an older note returns to its saved
+version. **Ctrl-X Ctrl-S** keeps the note. In the browser, **q** or **Ctrl-X
+Ctrl-C** quits. Empty new pages add no entries.
+
+- **n**: new blank note; **Enter** or **e**: edit the selected note.
+- **Ctrl-Shift-C**: copy the whole note text to the system clipboard while
+  writing or browsing, including unsaved edits. **Ctrl-C** does nothing.
+  The terminal must report the Shift modifier; Simpleterm does this for
+  raw-mode applications when no terminal text is selected.
+- Drag with the mouse in the reading pane to select and copy note text to the
+  system clipboard and primary selection. Only the original text is copied:
+  real indentation and line breaks remain, while pane borders, dates, layout
+  padding, and soft wraps are excluded. Double-click copies a word and
+  triple-click copies a logical line. **c** copies the whole note; right-click
+  copies the selection, or the whole note if nothing is selected. System copy
+  uses `wl-copy`/`wl-paste`, `xclip`, `xsel`, or `pbcopy`/`pbpaste` on macOS,
+  as available. Success is reported after reading back and verifying the copied
+  text; failed verification leaves the text in the internal clipboard.
+- **/**: search note text; submit an empty search to clear it. Pasted line breaks
+  become spaces, and only pressing Enter submits the search. Pasting in the
+  browser is ignored so the text cannot trigger commands.
+- **d**, then **y Enter**: move a note to trash; **t** opens trash and **r** restores.
+- **Left / Right** (or **h / l**): move between the year, notes, and reading
+  panes. The selected year and note stay highlighted when you move right.
+  Moving left into the year pane clears the note highlight.
+  The date turns bold blue while the reading pane is active and white when you leave.
+  Right from a year opens its notes. **Up / Down**
+  (or **j / k**) select years or notes in the first two panes and scroll one
+  visual line in the reader. **Page Up / Page Down** jump a page in the active
+  pane; the reader uses its visible text height. Moving between the notes and
+  reader keeps the current note and scroll position. **y** chooses a year even
+  on narrow terminals; **a** shows all years.
+- The editor has SimpleWords' mouse editing: click to place the cursor, drag
+  to select and copy, double-click for a word, triple-click for a logical line,
+  and drag beyond the page to scroll. Middle-click pastes the primary selection.
+  Clicking back into an inactive window preserves the cursor and viewport.
+- **Ctrl-W** cuts the selection, **Alt-W** copies it, and **Ctrl-Y** pastes the
+  system clipboard with the internal clipboard as a fallback. **Ctrl-Z**,
+  **Ctrl-_**, or **Ctrl-X u** undo; **Ctrl-R** or **Ctrl-X r** redo. Like
+  SimpleWords, typing and deletion group by words and pauses; replacement,
+  paste, cut, Tab, and Enter remain complete actions. Undo restores the cursor
+  and selection, and redo restores the result. Arrow and Emacs movement,
+  **Ctrl-Space** marking, and **Ctrl-K** line kill are available.
+- `--list` prints IDs, creation timestamps, and previews for scripts;
+  `--data-dir DIR` chooses a different notes directory.
+
+Storage defaults to `~/writing/notes`. Each dated UTF-8 text file holds at most
+100 entries, including recoverable trash. For example:
+
+```text
+~/writing/notes/
+  2026/
+    2026-10-05-001.txt
+    2026-11-12-002.txt
+  2027-01-03-001.txt
+```
+
+The date in the filename is the first note's creation date and the suffix is
+that year's batch number. Edits update an entry in its original file. On the
+first run in a new year (or while the app stays open across New Year), older
+files move into their `YYYY/` folders, including partial batches; new entries
+accumulate in the main folder. Files include readable creation and edit dates,
+trash state, and byte lengths so note text can contain delimiter-like lines
+without confusing the parser. Writes use atomic replacement and private file
+permissions. A directory lock prevents concurrent writers. Incomplete managed
+files stop loading with an error instead of being overwritten. Normal uninstall
+and `--purge` preserve `~/writing/notes`; confirmed `--burn` removes that notes
+directory, including its recovery files and trash.
+
+### simplewords
+
+- Startup behavior:
+  - `simplewords filename ...` restores the saved workspace first, then visits
+    every named document in its own buffer. Opening is additive to the buffer
+    collection but not to the window layout: the requested file takes over the
+    selected document window, so a one-window workspace stays at one and a
+    two-window workspace stays at two. Buffers remain in the background until
+    you explicitly remove them with `d` or `k` in the Buffer List.
+  - If a SimpleWords workspace is already running, the command sends the files
+    there and exits. Set `SIMPLEWORDS_NEW_INSTANCE=1` to force an independent
+    process; it still begins from the saved workspace snapshot before adding
+    the requested files.
+  - `simplewords --at LINE[:BYTE_COLUMN[:LENGTH]] -- filename` opens a file
+    at a specific occurrence, including through a running workspace. Line and
+    UTF-8 byte column start at one; an optional byte length highlights the text.
+    SimpleSearch uses this in an independent editor in the search terminal.
+    An older running editor that cannot receive locations causes a direct
+    command-line launch to open an independent
+    current-version editor instead.
+  - `simplewords` restores the accumulated buffers, cursor positions, and an
+    at-most-two-document window layout. Buffer List is transient and is not
+    resumed at startup. Older saved layouts with extra panes are reduced to the
+    selected document plus the most recently used other view; all their buffers
+    remain available. A second no-argument process restores the saved workspace
+    snapshot too, but cannot overwrite the primary process's session updates.
+  - Opening a file that is already present switches to its existing buffer.
+    Switching what a window displays never kills the document previously shown
+    there; it remains in the buffer collection and that window's history.
+- Arrows and Page Up/Page Down navigate.
+- Shift plus arrows/Page Up/Page Down extends selection where the terminal
+  reports modified keys.
+- Drag with the mouse to select document text. Highlighting stays inside the
+  writing area; releasing the button copies the original text to the clipboard
+  and, on X11/Wayland, the primary selection. Visual margins and screen wrapping
+  add no spaces or line breaks; actual indentation and paragraph breaks remain.
+  Double-click selects a word, triple-click selects a paragraph, and dragging
+  above or below the writing area scrolls the selection. Middle-click pastes
+  the primary selection. Shift-drag uses the terminal's own screen selection,
+  which includes screen padding.
+- Clicking back into an inactive window restores focus without moving the
+  cursor or scroll position. Once active, clicking still places the cursor and
+  dragging still selects text. This uses terminal focus reporting, supported
+  by Simpleterm and other compatible terminals.
+- `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
+  right without moving focus. It temporarily shows exactly the selected
+  document plus the list; background buffers and any second document view do
+  not expand into more panes. Click the frame or a buffer row to focus it, or
+  use `Ctrl-X o`. Up/Down chooses a buffer; Enter opens it in the right frame
+  and keeps the left document in place. Use `d` or `k` to kill, `s` to save,
+  `n` for a new draft, and `o` to open a file. Escape closes the list quickly
+  from either pane; `Ctrl-X 0` closes it when focused. Closing restores the prior one- or two-window presentation.
+  Killing a modified buffer asks first and retains its recovery copy.
+- `Ctrl-X Left` / `Ctrl-X Right`: move backward/forward through the selected
+  window's own buffer history, restoring that window's remembered view.
+- `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X b` or `Ctrl-X n`: new draft buffer.
+- `Ctrl-X Ctrl-D` or `Ctrl-X k`: close the current buffer and replace it with
+  the most recently used other buffer in the same frame. Closing the last buffer
+  leaves a blank draft. Modified buffers ask first and retain a recovery copy.
+- `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side. SimpleWords
+  keeps at most two document windows; additional documents remain buffers. A
+  split command always leaves focus mode and shows both windows. If two saved
+  views already exist, it reveals and reorients that pair instead of rejecting
+  the command or creating a third view.
+- `Ctrl-X o`: select the next window; `Ctrl-X 0`: close this window;
+  `Ctrl-X 1`: close the other windows. Closing a window keeps its buffer.
+- `Ctrl-X Ctrl-S`: save; `Ctrl-X Ctrl-W`: save as.
+- `Ctrl-X Ctrl-C`: quit.
+- `Ctrl-S`: find text; `n`/`N`: next/previous match.
+- `Ctrl-Z` or `Ctrl-X u`: undo; `Ctrl-R` or `Ctrl-X r`: redo.
+- `Ctrl-X Ctrl-Z`: focus mode.
+- `Ctrl-X Ctrl-T`: toggle typewriter sounds and save the setting to the config.
+- `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
+
+SimpleWords groups continuous typing into words with their following spaces;
+a pause of 1.5 seconds, navigation, saving, or switching windows or buffers
+starts a new step. Repeated Backspace and Delete group by words and pauses,
+with paragraph joins kept separate. Paste, cut, Tab, Enter, and typing over a
+selection undo as complete actions. Undo restores the original cursor and
+selection; redo restores the result. Returning to the saved revision clears
+the modified indicator, and saving keeps the history available. A new edit
+after undo clears redo; failed edits and unchanged replacements preserve it.
+Each buffer retains up to 1,024 steps within a 64 MiB history budget. History
+lasts for that buffer's lifetime in the running editor.
+
+### simplecal
+
+Top-level month view:
+
+- Month grid and agenda are sibling focus areas.
+- Tab or Shift-Tab switches focus between the month grid and agenda.
+- In month-grid focus, arrows move by day or week.
+- In agenda focus, Up/Down moves through events and Left/Right changes day.
+- Page Up/Page Down: previous/next month.
+- `Home` or `t`: today.
+- `y`: year view; `m`: month view.
+- Enter from the month grid focuses the agenda.
+- Enter from the agenda opens the selected event detail.
+- Backspace at top level only moves agenda focus back to the month grid.
+- `a`: create an event for the selected day.
+- `e`: edit the selected agenda or search event.
+- `d`: delete the selected agenda or search event; `D` confirms the first
+  delete prompt.
+- `/`: search events.
+- `c`: clear ringing reminders.
+- `?`: help.
+- `q`: quit from the top-level month/year view.
+
+Event card:
+
+- Event detail is read-only until edited.
+- In read-only detail, `e` edits; Esc or Backspace returns to the agenda.
+- In create/edit mode, Tab, Shift-Tab, Up, and Down move between fields.
+- Enter moves to the next field; on the Reminder row it opens the reminder
+  card.
+- Backspace edits text only; it does not save, cancel, or leave the card.
+- Esc cancels edits and returns one level up.
+- `Ctrl-S` saves and returns to the agenda.
+
+Reminder card:
+
+- Up/Down or Tab/Shift-Tab moves through alert and repeat choices.
+- Enter or Space selects the highlighted choice.
+- `Ctrl-S` applies the reminder choices back to the event edit card.
+- Esc or Backspace cancels reminder-card changes.
+
+Recurring delete:
+
+- Deleting a recurring event prompts for `this occurrence`, `whole series`, or
+  `cancel`.
+- Esc or Backspace cancels that prompt.
+
+### simpleflac
+
+- `simpleflac PATH` opens a track, cue sheet, playlist, or directory directly.
+- Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
+- `Space`: pause.
+- `c`: playlist/mode action shown in the footer.
+- `p`: add to playlist/queue.
+- Left/Right: seek back/forward 15 seconds.
+- Shift-Left/Shift-Right: previous/next track.
+- The top progress bar shows elapsed and total track time.
+- `r`: random on/off.
+- Page Up/Page Down: jump up/down 10 entries in the list.
+- Shift-Page Up/Shift-Page Down: volume up/down.
+- `q`: quit.
+
+### simpleradio
+
+- `simpleradio PATH` opens a playlist or directory directly.
+- Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
+- `Space`: pause.
+- `c`: toggle auto-next/stay mode.
+- Page Up/Page Down: jump up/down 10 entries in the list.
+- Shift-Page Up/Shift-Page Down: volume up/down.
+- Station startup runs in the background, leaving navigation responsive while
+  the status line reports connection or retry results.
+- `q` or Esc: quit.
+
+### simplepod
+
+- Up/Down: select; Enter: open a show or play an episode.
+- `i`: podcast search.
+- `D`: deep episode search after an initial podcast search.
+- `f`: find in the visible list; `n`/`N`: next/previous match.
+- Left/Right: seek -15/+30 seconds.
+- Page Up/Page Down: volume up/down.
+- `r`: resume selected episode when resume data is available.
+- `Space`: pause.
+- `b` or Backspace: go back.
+- `q`: quit.
+
+### simplenews
+
+- Up/Down or `j`/`k`: move.
+- Enter opens a feed, article list item, or article.
+- Backspace, Left, or `h`: go back.
+- `p`: pull/refresh all feeds in the background.
+- `R`: refresh the current feed in the background.
+- Esc cancels an active feed refresh.
+- `o`: open the selected article in the configured browser.
+- `i`: show or hide failed feeds.
+- `g`/`G`: top/bottom.
+- `q`: quit.
+
+### simplebrowse
+
+- `simplebrowse URL`: use fast auto mode, preferring the direct static path and
+  falling back to WebKit when needed.
+- `simplebrowse --reader URL`: force the direct static reader path.
+- `simplebrowse --js URL`: force WebKit JavaScript mode.
+- `simplebrowse --dump URL`: print cleaned page text; automatically retries
+  likely JavaScript shells with JS mode when available.
+- `simplebrowse --dump-js URL`: print cleaned page text after JavaScript.
+- `simplebrowse --dump-links URL`: print the computed visible link navigation
+  list with rendered line/column bounds.
+- `simplebrowse --dump-links-js URL`: print the link list after JavaScript.
+- `simplebrowse --clear-cache`: remove cached page snapshots from
+  `$XDG_CACHE_HOME/simplebrowse/pages` or `~/.cache/simplebrowse/pages`.
+- Ctrl-L: focus the URL bar.
+- Enter: load the URL bar, open the selected link, edit the selected field, or
+  submit the selected form button.
+- Digits then Enter: open or activate the numbered visible link/field group.
+- Shift-Down/Shift-Up: next/previous visible link or form control, jumping
+  screens as needed. Links are underlined before selection.
+- Page Down/Page Up: scroll one screen.
+- Space: toggle a selected checkbox/radio button; otherwise page down.
+- Up/Down or `j`/`k`: scroll line by line.
+- `b` or Space: page through text.
+- Backspace: back.
+- Home/End: top/bottom.
+- `g`: likely article/content heading; `G`: past top navigation.
+- `/`: find; `n`/`N`: next/previous match.
+- `f`: forward.
+- `r`: reload in the selected mode.
+- Esc: cancel a pending load.
+- `A`: select fast auto mode and reload.
+- `B` (or legacy `J`): select WebKit mode and reload.
+- `R`: select static reader mode and reload.
+- `m`: bookmark current page; `M`: bookmark list.
+- `s`: save cleaned page text.
+- `C`: clear cached page snapshots.
+- `o`: open current URL externally; `O`: open selected link externally.
+- `q`: quit.
+
+Form fields use the same terminal editing conventions as SimpleWords where the
+browser can reasonably share them: Enter starts editing or submits, Esc leaves
+field editing, Tab inserts a tab while editing, Ctrl-Left/Right moves by word,
+Shift-Left/Right selects, Alt-w copies, Ctrl-w cuts, Ctrl-y pastes, Ctrl-z
+undoes, and Ctrl-r redoes.
+
+To exercise browser compatibility, run `make test-simplebrowse-compat test-simplebrowse-webkit`.
+The opt-in `make tour-simplebrowse` visits the
+public test corpus in reader, auto, and JS modes; `make journeys-simplebrowse`
+performs public searches. Both write reports under `build/`. See the
+[capability matrix and repair loop](SIMPLEBROWSE-COMPATIBILITY.md) for check
+definitions, strict WebKit testing, and known limitations.
+
+### simplebook
+
+- With no file argument, open the built-in folder browser, using the same
+  layout and controls as SimpleChange's file picker. Enter opens a folder or
+  book; Up/Down or `j`/`k` selects; Page Up/Page Down scrolls the list. Use `/`
+  to filter names (Enter finishes editing), `g` to enter a folder path,
+  Backspace to go to the parent folder, `~` for home, and `.` for hidden files.
+  Esc or `q` closes the picker. Folders appear first, followed by supported books.
+- PDFs open in a centered, reflowed reading layout; use `--layout` to start in
+  the source layout instead. Extracted text is cached privately so repeat opens
+  do not rerun the converter.
+- EPUB, MOBI, AZW and AZW3 books open in reading layout. MOBI/Kindle conversion
+  uses the bundled helper; its EPUB and extracted text are cached together,
+  retaining internal links and chapter navigation. The picker includes these formats.
+- Up/Down or `j`/`k`: scroll vertically.
+- Page Up/Page Down or Space/`b`: move by one screen.
+- Shift-Up/Shift-Down: select the previous/next internal link; the first press
+  starts with the visible screen, and Enter follows it. PDF contents links are
+  scanned in the background from the first paint and underlined when ready;
+  unusual PDF links in prose are inspected on demand. EPUB and MOBI/Kindle
+  anchors are retained during extraction.
+- Backspace: return to the exact reading position before a link or chapter
+  jump. Repeated jumps maintain a back stack.
+- `o`: open the chapter navigator. It is available for PDFs and ebooks; ebook
+  contents destinations come from the book's navigation map when available.
+- `[`/`]`: previous/next physical PDF page; `p`: go to a page number.
+- `/` or `f`: find; `n`/`N`: next/previous match.
+- `r`: toggle reading/source layout. In source layout, Left/Right or `h`/`l`
+  pans horizontally and `c` or `0` returns to the left edge.
+- `i`: focus mode; `?`: shortcut guide.
+- `g`: top; `G`: bottom.
+- `q` or Esc: quit.
+
+### simplevis
+
+- `q`: quit.
+- `i`: information overlay.
+- `c`: toggle the continuous spectrum cycle or pure `#ffffff` bars. Each
+  activation starts at a random hue. The vivid two-minute loop spends equal
+  time in all six hue sectors, with tiny updates
+  at 60 frames per second and no pauses. Smooth transitions require a terminal
+  with a changeable color palette; fixed palettes use the nearest colors.
+- `b`: toggle the wallpaper's accent color or pure `#ffffff` bars. The accent
+  comes from SimpleWM's generated `colors.Xresources` palette and follows
+  wallpaper changes automatically. Without a wallpaper palette, the terminal's
+  default foreground is used.
+- `+`/`-`: gain up/down.
+- Left/Right: bar width.
+- Up/Down: vertical reach.
+
+### simpleclock
+
+- `w`: open/close the current-weather view.
+- `r`: refresh while viewing weather; reset the stopwatch otherwise.
+- `s`: stopwatch start/stop.
+- `t`: set timer using values such as `30s`, `5m`, `2h`, or `1d`.
+- `Space`: pause/resume timer.
+- `a`: set alarm as `HH:MM`.
+- `x`: stop ringing.
+- `c`: clear timer/alarm.
+- `q`: quit.
+
+### simplestats
+
+RAM and root disk usage show the used amount followed by its percentage.
+On Linux, RAM usage excludes buffers, file cache, and reclaimable slab cache,
+while keeping shared memory/tmpfs in the used amount. Disk usage excludes
+reserved free space. Battery level includes whether the machine is plugged in.
+
+- `q`: quit.
+
+### simplever
+
+- `p`: pull.
+- `t`: status.
+- `d`: diff / changed files.
+- `u`: upload only.
+- `s`: save / commit / push.
+- `l`: latest commits.
+- Esc cancels a running Git command.
+- Up/Down or `j`/`k`: scroll output.
+- Page Up/Page Down: page output.
+- `q`: quit.
+
+### simplegame
+
+- Arrows or `hjkl`: move.
+- `w/a/s/d`: throw.
+- `q`: quit.
+
+## Configuration and Data
+
+### SimpleNews
+
+Feeds are stored in:
+
+```text
+~/.config/simplenews/urls
+```
+
+When `XDG_CONFIG_HOME` is set, SimpleNews uses
+`$XDG_CONFIG_HOME/simplenews/urls` instead.
+
+One feed per line. Supported forms include:
+
+```text
+https://www.newyorker.com/feed/everything
+https://lithub.com/feed/ Literary Hub
+The Paris Review | https://www.theparisreview.org/blog/feed/
+```
+
+Optional settings are stored in:
+
+```text
+~/.config/simplenews/config
+```
+
+Example:
+
+```text
+browser=links %u
+timeout=8
+feed_timeout=18
+max_articles=200
+```
+
+`build.sh` creates example files at:
+
+```text
+~/.config/simplenews/urls.example
+~/.config/simplenews/config.example
+```
+
+### SimpleMail
+
+Message lists show a right-aligned date in the user's local time zone: an AM/PM
+time for today's mail, a month and day for earlier mail, and the year when it
+differs from the current year.
+
+Configuration is stored in:
+
+```text
+~/.config/simplemail/config
+```
+
+When `XDG_CONFIG_HOME` is set, SimpleMail uses
+`$XDG_CONFIG_HOME/simplemail/config` instead.
+
+Example:
+
+```text
+# maildir=~/Mail
+
+inbox=Inbox
+sent=Sent
+drafts=Drafts
+archive=Archive
+trash=Trash
+
+sync_cmd=mbsync inbox
+send_cmd=msmtp -t
+# from=Your Name <you@example.com>
+```
+
+For Gmail delivery into SimpleMail with no retained server copy:
+
+```text
+sync_cmd=simplemail-fetch --account gmail --remove-server-copy
+watch_cmd=simplemail-fetch --account gmail --remove-server-copy --watch --control-stdin
+fetch_on_start=1
+check_interval=10
+send_cmd=msmtp -a gmail -t
+```
+
+`simplemail-fetch` uses Python 3's standard library and the existing
+`IMAPAccount gmail` credentials in `~/.mbsyncrc` (verified IMAPS, `Pass` or
+`PassCmd`). `--credentials`, `--config` and `--account` can override these
+locations and the account name. `simplemail-fetch --check` lists server counts
+without modifying mail. `--download-only` saves all mail while retaining the
+server copies, for a migration before enabling removal. This delivery mode
+currently supports Gmail.
+
+The receiver imports Inbox, Sent, Drafts, All Mail into Archive, Spam, and
+Trash. It saves the entire MIME message, verifies its size, flushes the file
+and its directory to disk, and commits a delivery receipt before removing
+that exact server copy. Existing local copies, read state and folder choices
+are retained. Retries respect local moves and deletions. Gmail's
+[message IDs across labels](https://developers.google.com/workspace/gmail/imap/imap-extensions)
+prevent repeated downloads; removal uses
+[UID EXPUNGE](https://datatracker.ietf.org/doc/html/rfc4315)
+for delivered messages only. Local mail is never uploaded by this tool.
+Original Gmail label metadata is also retained in the local delivery receipts
+under `.simplemail-received` inside the Maildir.
+Small messages are downloaded in batches. Empty checks skip local archive
+indexing, and subsequent downloads reuse cached fingerprints for unchanged
+files; an existing copy is verified again before it can authorize removal.
+Folder count requests are sent together, and only folders containing mail
+are opened for delivery. Checks also process any mail moved into server Trash
+during that delivery, even when Trash started empty.
+
+Set `Sync None` and `Expunge None` in the old Gmail `mbsync` channels when
+switching to local delivery; running a mirror against this Maildir could
+otherwise re-upload mail or propagate server deletions into the local copy.
+Scriptorium's Gmail setup supports `--local-only` to configure this mode.
+Back up the Maildir, which becomes the primary copy of your mail.
+
+`watch_cmd` keeps one mail connection open while SimpleMail is running.
+[IMAP IDLE](https://datatracker.ietf.org/doc/html/rfc2177) notifies the receiver
+when Inbox mail arrives, without waiting for a poll or another login. The
+message appears as soon as the complete local copy and receipt are saved;
+server cleanup continues in the background. Other folders are checked every
+10 seconds over the same connection. `p` and successful sends request an
+immediate check on that connection. The watcher stops when SimpleMail quits
+and reconnects automatically after an interruption. Empty checks leave the
+local message list in memory; a burst of delivery notifications refreshes it
+once per UI update.
+
+Without `watch_cmd`, `fetch_on_start=1` checks on launch and
+`check_interval=10` schedules checks; both default to disabled (`0`).
+A successful send also requests a check, so Gmail's outgoing copy is removed
+while SimpleMail retains its Sent copy. Outgoing MIME is saved durably before
+SMTP starts. One-shot checks retry temporary failures once; committed receipts
+let cleanup resume without downloading the same message again. Failed checks
+show the receiver's reason and can be retried with `p`; periodic checks also
+retry automatically.
+One-shot checks log to `$XDG_STATE_HOME/simplemail/pull.log` (normally
+`~/.local/state/simplemail/pull.log`); live connection errors use `watch.log`
+alongside it. The most recent failed check is retained
+in `pull-error.log` alongside it, even after a later check succeeds. Incoming
+mail can arrive on the server while SimpleMail is closed and is delivered on
+the next launch or check.
+
+Maildir precedence is:
+
+1. uncommented `maildir` in `~/.config/simplemail/config`
+2. `SIMPLEMAIL_MAILDIR`
+3. existing legacy `~/.local/share/simplemail/mail` when `~/Mail` does not exist
+4. `~/Mail`
+
+### SimpleCal
+
+The config file is:
+
+```text
+~/.config/simplecal/config
+```
+
+Current config keys include:
+
+```text
+data_dir=$HOME/.local/share/simplecal
+default_reminder_lead_times=10,30,60
+theme=default
+today_color=yellow
+first_day_of_week=sunday
+clock=24h
+reminders_auto_install_attempted=0
+legacy_migration_warned=0
+```
+
+`data_dir` may be absolute, `~/...`, `$HOME/...`, or relative to
+`~/.config/simplecal`. The legacy key `DATA_DIR` is still accepted for older
+configs.
+
+Events are plain text files under:
+
+```text
+DATA_DIR/events/YYYY/YYYY-MM-DD.cal
+```
+
+Reminder state is stored in:
+
+```text
+DATA_DIR/reminders.db
+```
+
+Setup and maintenance commands:
+
+```sh
+simplecal --setup
+simplecal --data-dir /path/to/calendar
+simplecal --install-reminders
+simplecal --check-reminders
+simplecal --reminder-daemon
+simplecal --reconcile-reminders
+simplecal --clear-reminder EVENT_ID
+simplecal --clear-reminders
+simplecal --clear-all-reminders
+```
+
+SimpleCal installs background reminders automatically when possible, or you can
+retry setup with `simplecal --install-reminders`.
+
+Systemd user systems get a persistent service:
+
+```text
+~/.config/systemd/user/simplecal-reminders.service
+```
+
+The service runs `simplecal --reminder-daemon`, checks frequently, and restarts
+on failure. If systemd user services are unavailable, SimpleCal falls back to a
+cron entry that runs `simplecal --check-reminders` once per minute.
+
+When a reminder becomes due it is marked `STATUS=ringing` and alarm playback
+continues or retries until cleared. Clear alarms in the TUI with `c`, or from
+the shell with the clear commands above.
+
+Reminder playback logs due time, current time, drift, alarm path, audio
+environment, player command, player PID, and exit status. It starts
+`simpleplay-core`, which uses SDL's system audio output, then tries emergency
+platform players if the engine cannot start.
+Set `SIMPLECAL_ALARM_PLAYER` to override the player command for local testing.
+
+### SimpleClock
+
+SimpleClock stores timer/alarm reminder state under:
+
+```text
+~/.local/state/simpleclock/reminders
+```
+
+It supports:
+
+```sh
+simpleclock --install-reminders
+simpleclock --check-reminders
+simpleclock --clear-reminders
+```
+
+Systemd user systems get a timer backend; cron is used as a fallback.
+
+Press `w` to fetch the current conditions and show them beside a small ASCII
+weather scene. The request runs outside the UI process, so a slow or offline
+connection cannot pause the clock, timers, or alarms. Results stay fresh for
+ten minutes, and `r` forces a refresh while the weather view is open.
+
+By default, [wttr.in](https://github.com/chubin/wttr.in) infers the location
+from the connection's public IP and chooses US or metric units for that area.
+Override either choice when travelling, when IP location is inaccurate, or
+when you do not want automatic IP geolocation:
+
+```sh
+SIMPLECLOCK_LOCATION="Toronto" simpleclock
+SIMPLECLOCK_LOCATION="40.7128,-74.0060" SIMPLECLOCK_UNITS=metric simpleclock
+```
+
+`SIMPLECLOCK_UNITS` accepts `metric` or `imperial` (and the short forms `m` or
+`u`). Weather is fetched only after the weather view is opened.
+
+### SimpleFiles
+
+Configuration is stored in:
+
+```text
+~/.config/simplefiles/config
+```
+
+SimpleFiles starts in the current working directory by default. Pass a
+directory path to start elsewhere. See `simplefiles-config.example` for
+supported settings, including preview behavior, trash directory, text
+extensions, and extension openers. Image files are detected by content type
+and decoded by `ffmpeg`. SimpleFiles displays them as pane-resolution terminal
+graphics through the Kitty protocol (Kitty, WezTerm, and Ghostty), the iTerm2
+inline-image protocol, or SIXEL when the terminal positively advertises it.
+If no supported graphics protocol is available, or an image cannot be decoded,
+the right pane automatically shows the normal file-information view instead;
+there is no low-resolution character-cell image fallback.
+
+Graphics detection is automatic. For troubleshooting, override it with
+`SIMPLEFILES_GRAPHICS=none`, `kitty`, `sixel`, or `iterm2`; use `auto` (or leave
+the variable unset) for normal detection.
+
+Command mode is opened with `:`:
+
+```text
+:cd <path>           Change directory
+:mkdir <name>        Create directory
+:rename <newname>    Rename selected file
+:compress <name>     Create a ZIP archive from the selection/current item
+:extract             Extract the selected ZIP, TAR, or compressed tarball
+:delete              Move selected/current item(s) to trash in the background
+:delete!             Permanently delete; TTY sessions prefer sudo, graphical launches use pkexec
+:emptytrash          Permanently empty trash
+:openwith <prog>     Open file with the chosen application
+:unmount             Unmount the highlighted drive directory
+:hidden              Toggle hidden files
+:reload              Reload the current directory
+:q or :quit          Quit
+```
+
+With `TRASH_DIR` unset, `:delete` uses the freedesktop trash on the source
+filesystem and `:emptytrash` clears home and mounted-volume trash, including
+NFS server trash from the client. If `TRASH_DIR` is configured, both commands
+use only that custom path.
+
+On Linux, SimpleFiles checks the mounted NFS server before entering its trash.
+Plain TCP/UDP mounts use a read-only [NFS NULL request](https://www.rfc-editor.org/rfc/rfc1813#section-3.3.1)
+with a short deadline, using the mount's address, version, transport and service
+port. TLS mounts check the endpoint and use the kernel's authenticated connection;
+other transports retain bounded filesystem handling. The existing worker timeout
+also bounds filesystem I/O if a server goes away during deletion. Unavailable
+remote trash is reported as deferred; local
+trash still empties, and pending remote payloads and recovery metadata are retained.
+Each `:emptytrash` checks again, so a reconnected server resumes normal remote
+trash handling on the next request. An unavailable or vanished mount is never
+treated as an empty directory or replaced with its underlying local directory.
+Kernel-only filesystems such as `/sys/fs/bpf` are excluded from trash discovery.
+
+`:extract` supports `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tgz`,
+`.txz`, and `.tbz2`, creating a new directory named after the archive.
+
+SimpleFiles discovers removable volumes through GIO. Mounted volumes remain
+ordinary directories. Mountable unmounted volumes appear in the current
+user's `/media` or `/run/media` hierarchy; Enter or Right mounts the selected
+volume and opens its actual mount path. On most systems, `:unmount` accepts the
+exact mount directory of a removable volume from that same drive snapshot. A
+volume successfully unmounted by SimpleFiles stays visible while it remains
+attached and immediately returns to the `Enter/Right mounts` state.
+
+On FreeBSD, SimpleFiles also understands the `/media` autofs map directly. It
+keeps display labels such as `T7` or `New Volume` separate from the exact
+device and sanitized autofs key, so unlabeled volumes and duplicate or unusual
+labels remain unambiguous. It can mount validated media through the privileged
+helper, can unmount the current media tree, and validates both operations
+against the live mount table. The system `automountd` service still supplies
+the normal `/media` entries; the helper covers only the exact root-owned
+mount/unmount operation requested by SimpleFiles and never performs a global
+automount cleanup.
+
+Raw-device formatting and ISO writing are intentionally not provided. Device
+names such as `/dev/sdb` can be reassigned after unplugging, so destructive
+operations require stronger identity revalidation than ordinary mounting and
+unmounting.
+
+### SimpleWords
+
+SimpleWords stores autosave/session state under:
+
+```text
+~/.local/state/simplewords
+```
+
+The `workspace` state file records the whole process-local buffer shelf, split
+layout, and each window's own backward/forward buffer history and remembered
+views—not just the last document. If it is absent, SimpleWords can import the
+older single-document `session` state on startup. Each modified buffer keeps
+its own autosave, and untitled drafts are restored by their stable draft names.
+Autosaves remain recovery copies: they do not silently overwrite the visited
+file. Explicit saves still create timestamped backups under the same state
+directory.
+
+The primary process holds a workspace lock and a private local command socket.
+This gives ordinary `simplewords file.txt` launches the useful part of Emacs's
+server/client behavior without requiring a daemon command. Document locks are
+taken on the first edit and released on save, so a second independent process
+is warned and prevented from editing the same path concurrently. Lock files
+contain no document text. A save is also blocked if the visited file changed on
+disk since it was opened; `Ctrl-X Ctrl-W` is the deliberate override path after
+you have inspected the situation. Closing the terminal also counts as exiting:
+SimpleWords flushes recovery and workspace state and releases ownership when
+its terminal disconnects. If another SimpleWords window is still open, it
+automatically takes ownership and snapshots its own workspace state.
+
+It uses Wayland clipboard helpers when available, then X11 clipboard helpers
+when available.
+
+Optional typewriter-key audio is configured in:
+
+```text
+~/.config/simplewords/config
+```
+
+The installed defaults keep it disabled:
+
+```text
+typewriter_sound=false
+typewriter_sound_file=simplewords-typewriter.wav
+typewriter_sound_alt_file=simplewords-typewriter-alt.wav
+typewriter_sound_space_file=simplewords-typewriter-space.wav
+typewriter_sound_enter_file=simplewords-typewriter-enter.wav
+typewriter_sound_delete_file=simplewords-typewriter-delete.wav
+typewriter_sound_volume=70
+```
+
+Set `typewriter_sound=true` to enable it; volume `70` is recommended for the
+bundled scheme. Every sound path expands a leading `~` or `$HOME`, and volume
+is clamped to `0`–`100`. The five files form one
+fixed old-typewriter effect: `A E I N O S T U` use the alternate clack, other
+printable characters and Tab use the main clack, and Space, Enter, and a
+successful Backspace/Delete use their dedicated sounds. Sounds are requested
+only after the corresponding keyboard edit succeeds; navigation, modifiers,
+commands, paste, undo, and generated text stay silent.
+
+The WAVs are decoded once at startup and mixed in-process with overlapping
+tails. Missing files and unavailable audio output are ignored silently. If an
+alternate or delete file is absent, the main clack is used as a compatibility
+fallback; a missing main file disables the effect for that run.
+
+See [the sound provenance notice](assets/simplewords-typewriter-NOTICE.md)
+before redistributing the bundled WAV files.
+
+## License
+
+See [LICENSE](LICENSE).
+
+## SimpleBurn
+
+Run `simpleburn` (or the Scriptorium alias `burn`). It opens `fzf` to find an
+ISO under your home directory, then shows suitable whole drives by device,
+capacity, and model. Use the arrow keys to choose, **Enter** to continue, and
+**y** to confirm erasing that drive. Mounted volumes on the selected drive
+are unmounted, `dd` writes the ISO, and the drive is flushed before success
+is reported. **q** cancels; an interrupted write leaves an incomplete image.
+Writing and flushing happen in 16 MiB batches. The progress bar counts only
+successfully flushed bytes and reaches 100% after the burn completes.
+
+**r** refreshes drives and **f** chooses another ISO. To search a mounted
+share or another directory, run `simpleburn /path/to/directory`. The read-only
+`simpleburn --list-drives IMAGE.iso` lists eligible destinations.
+The ISO search checks `Downloads` first and streams matches into `fzf` as
+they are found. It skips nested mount points so an offline share cannot hold
+up the home-directory search; pass the share's path to search it directly.
+
+Linux uses `lsblk`/`umount`, FreeBSD uses native GEOM and mount information,
+and macOS uses `diskutil` and the raw disk device. System disks, the ISO's
+own drive, read-only or undersized media, swap, and active storage stacks
+are excluded. Only volumes under `/media`, `/run/media`, `/mnt`, or
+`/Volumes` can be automatically unmounted. Administrator authentication
+uses `sudo` after confirmation. ISOs must contain complete 2048-byte sectors.
+
+SimpleBurn is included in the standard suite and Scriptorium installations
+on Linux, FreeBSD, and macOS. It requires `fzf`, `dd`, and `sudo` (unless
+already running as root); storage tools are supplied by util-linux on Linux
+and the base operating system on FreeBSD/macOS.
+
+## SimpleSave
+
+Run `simplesave` (or `save`) and press **b** to create one
+`~/backups/MM-DD-YY.zip` containing `~/writing`, `~/scriptorium`,
+`~/simplesuite`, plus `~/website` and `~/simplewm` when present. The first three folders are
+required. Writing, source, assets, and hidden files are included; `.git` is
+preserved in full so extracted folders remain Git repositories, including
+uncommitted changes and untracked writing. Symlinks are preserved. Requires `zip`.
+Generated directories such as `build`, `dist`, `target`, `node_modules`, virtual
+environments, and language caches are skipped. Compiled programs (including
+extensionless ELF, Mach-O, and PE binaries), object/library files, bytecode, and
+editor temporary files are skipped outside `.git`. Scripts, images, audio, and
+documents stay in the archive. These are artifact filters, not a tracked-files
+list: files do not need to be committed, and `.gitignore` does not hide writing.
+Press **r**, then **y**, to replace today’s backup; the previous archive stays
+intact until compression succeeds. Press **q** to quit or cancel a running
+backup. `simplesave --backup` creates a backup without the terminal UI and
+refuses to replace an existing archive. Backups are local; copy them to another
+drive for protection against disk failure.
+
+## SimpleSearch
+
+Run `simplesearch` (short command: `search`) and type a literal phrase to search
+file contents in `~/writing`. A quiet list shows each matching line with its
+relative path and line number. Results from `moleskin` come first, followed by
+`notes`, then the remaining top-level entries from oldest to newest modification
+time (with filename order inside each folder). Matching phrases are highlighted, including
+repeated occurrences and case differences. Each excerpt uses up to four wrapped
+lines, with surrounding source lines for context. Long paragraphs crop around
+the phrase to keep the match visible.
+The prompt stays in place while complete result sets replace the previous list;
+searching happens in the background, with no terminal scrolling or screen clears
+while typing. During rapid navigation the cursor stays hidden, then returns
+to the search prompt when you pause.
+
+Use Up/Down or Page Up/Page Down to select a result. Enter opens its file in
+SimpleWords with the cursor at the matching phrase, highlighted and scrolled into
+view. The editor opens just that document in the search terminal, preserving
+your regular SimpleWords workspace. C-x C-c returns to the results; C-x C-d
+also returns when you close the last document opened from search. Returning
+from the editor preserves the query and refreshes the results. Ctrl-U clears
+the prompt; Ctrl-W deletes a word; Left/Right and Home/End edit the query; Ctrl-R
+refreshes the search; Escape quits. The mouse wheel scrolls the results, a click
+selects, and a double-click opens.
+
+Search ignores case under the current locale, supports Unicode in UTF-8 locales,
+and treats punctuation literally. It recurses through hidden text files too,
+skipping `.git`, symbolic links, and binary files. Each matching line gets one
+result; phrases match within a line, like grep. Files are reread for every query,
+so no index or database needs rebuilding. No external search program is required.
+
+### Native PDF reading
+
+`./install-simplepdf.sh` installs the GTK PDF reader and its Evince development
+and runtime dependencies separately, like Simpleterm and Simpleplay. It is also
+included in `make full` / `make install-full` and Scriptorium's desktop phase.
+`simplepdf file.pdf` preserves original page rendering with pinch zoom, smooth
+scrolling, text selection, search, contents and remembered position. See
+[SIMPLEPDF.md](SIMPLEPDF.md) for installation and controls.
+
+![SimplePDF native reader](screenshots/simplepdf.png)
+ The terminal reader
+is now `simplebook`; it retains PDF text/reflow and EPUB/Kindle support, and its
+converter is `simplebook-mobi`. Run `book` (or `simplebook`) for terminal reading and `pdf`
+for the GTK reader. Bash's `read` builtin remains available.

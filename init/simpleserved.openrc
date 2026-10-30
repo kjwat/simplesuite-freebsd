@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+
+name="SimpleServe daemon"
+description="Export and discover SimpleServe NFS/SMB shares"
+command="/usr/local/sbin/simpleserved"
+supervisor="supervise-daemon"
+pidfile="/run/simpleserved.pid"
+respawn_delay=2
+
+depend() {
+    after net avahi-daemon
+}

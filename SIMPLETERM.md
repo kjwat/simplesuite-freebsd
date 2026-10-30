@@ -1,0 +1,293 @@
+# Simpleterm
+
+Simpleterm is a standalone C terminal emulator using GTK 3 and VTE, with
+GNOME Terminal as the interaction reference. It owns its defaults and does
+not read GNOME Terminal profiles or require GNOME Terminal to be installed.
+Its preferences panel uses a single Default profile, with Text, Colors, and
+Scrolling pages similar to GNOME Terminal. Each window has one terminal;
+terminal tabs are not supported.
+
+## Separate installation
+
+```sh
+cd ~/simplesuite
+./install-simpleterm.sh
+```
+
+The installer installs missing compiler and library dependencies, builds
+Simpleterm, and installs `/usr/local/bin/simpleterm`. It also adds the
+Simpleterm application launcher under `/usr/local/share/applications` on
+Linux and FreeBSD, with a link under `/usr/share/applications` for launchers
+that search only that directory. Both use the same desktop file ID, so XDG
+menus show one entry. On macOS, it installs a real
+`/Applications/Simpleterm.app` bundle, registers it with Launch Services,
+and requests Spotlight indexing as the invoking user. It upgrades the
+older `/Applications` symlink automatically. This guide also goes under
+`/usr/local/share/simplesuite/simpleterm`.
+Run it as your regular user; it requests administrator authentication for
+packages and system copying. Re-running it updates the application.
+
+The launcher follows the [XDG Desktop Menu specification](https://specifications.freedesktop.org/menu/latest/)
+and has no desktop-specific visibility restrictions. GNOME, Cinnamon, MATE,
+Xfce, KDE Plasma, and application launchers such as rofi (`drun` mode) use
+this registration. KDE's application cache is refreshed as the invoking
+user after installation and removal. Rofi's desktop inventory cache is
+invalidated, preserving its launch history. Other XDG menus monitor the installed
+desktop files. A window manager with a hand-written menu needs an explicit
+menu item pointing to `/usr/local/bin/simpleterm`; installing a desktop file
+cannot edit every possible personal menu configuration. rofi's `run` mode
+uses the shell's `PATH`, while `drun` uses desktop files.
+
+If `/usr/share` is read-only, the installer retains the normal launcher in
+`/usr/local/share/applications` and reports that the compatibility link could
+not be installed. Such sessions must include `/usr/local/share` in
+`XDG_DATA_DIRS`. Uninstallation removes both owned registrations, the icon,
+and the macOS bundle, while preserving unrelated files and preferences.
+
+The custom Simpleterm icon is embedded in the executable for terminal
+windows, preferences, and the About dialog, so launching a build directly
+uses the same artwork. The PNG is installed under
+`/usr/local/share/simplesuite/simpleterm` and used directly by Linux and
+FreeBSD desktop launchers. macOS includes a normal/Retina `.icns` icon in
+the Finder application bundle and sets the native Dock icon for both Finder
+and shell launches. The source icon, `assets/simpleterm.png`, uses alpha
+transparency outside its rounded metal frame. The macOS icon is generated
+in ignored `build/` using the existing GTK libraries. No image conversion
+packages are needed.
+
+Simpleterm has a standalone installer and stays outside `program-manifest.sh`,
+the default `make all`/`make install` targets and `build.sh`. Scriptorium's
+`install.sh` runs that installer automatically and provisions its GTK/VTE
+dependencies. SimpleOS's `simpleupdate` also stages it with suite updates.
+
+Supported package installers: Debian/Ubuntu (`apt-get`), Fedora/RHEL
+(`dnf` or `yum`),
+openSUSE (`zypper`), Arch (`pacman`), Void (`xbps-install`), Alpine (`apk`),
+Gentoo (`emerge`), macOS (`brew`), and FreeBSD (`pkg`).
+The repositories must provide GTK 3.24+, VTE 0.60+ for GTK 3, and PCRE2.
+The GLib resource compiler (`glib-compile-resources`), supplied with GLib
+development tools, embeds the included PNG during compilation.
+GTK and VTE runtime libraries are installed by the development packages.
+Older repositories can still be incompatible: the installer reports the
+missing or outdated libraries rather than adding third-party repositories
+or silently replacing system libraries. Other Linux distributions can use
+`--no-deps` after provisioning those dependencies themselves.
+
+On macOS, install [Homebrew](https://brew.sh) and Apple's Command Line Tools
+(`xcode-select --install`) first, then run the same installer as your regular
+user. It discovers Homebrew in `/opt/homebrew` on Apple Silicon and
+`/usr/local` on Intel Macs, uses its GNU Make and library metadata, and keeps
+Simpleterm itself in `/usr/local/bin`. Homebrew package installation runs as
+your user; copying the finished application still requests administrator
+authentication. Open Simpleterm from Finder or run `simpleterm` in a shell.
+`BREW` can select a different Homebrew executable. Provisioned GTK/VTE
+libraries also work with `--no-deps` without requiring Homebrew.
+
+FreeBSD uses `pkg` for dependencies and selects `gmake` for compilation.
+Other Linux distributions, including systems with custom package management,
+use the same installer with `--no-deps` once their build and runtime
+dependencies are available. For example, on NixOS, provide the compiler,
+GNU Make, pkg-config, GTK 3, GTK 3 VTE, PCRE2, fonts, and desktop utilities
+through your Nix development environment; its dependency closure must remain
+available for the installed program. For distribution packaging, use
+`DESTDIR` to stage files for that distribution's package builder.
+
+Running the application requires a graphical desktop; compiling
+and staging do not require a display. The system installation requires a
+writable `/usr/local` and administrator access, with no user-local fallback.
+
+VTE 0.60–0.74 use a GTK context menu with the same actions and mouse-reporting
+override. VTE versions before 0.76 retain their original paste-scrolling
+behavior; the independent Scroll on Paste preference takes effect on 0.76+.
+
+```sh
+./install-simpleterm.sh --build-only  # Dependencies and compilation only
+./install-simpleterm.sh --no-deps     # Dependencies already provisioned
+./install-simpleterm.sh --uninstall  # Remove app; retain shared packages
+```
+
+For packaging, `DESTDIR=/absolute/path ./install-simpleterm.sh --no-deps`
+stages the system layout, including launcher links or the macOS app bundle,
+without installing packages, requesting root, or refreshing host caches.
+The staging root must not resolve to `/`, and destination directories must
+not escape it through symlinks. Staged uninstallation also stays within it.
+
+`SIMPLETERM_BUILD_DIR` overrides `build/`, but may not resolve to the source
+root. The checkout path can contain spaces; the build subpath passed to GNU
+Make must not contain whitespace or Make metacharacters.
+`SIMPLETERM_NONINTERACTIVE=1` avoids authentication prompts and requires root,
+passwordless sudo, or an available noninteractive `doas` configuration.
+`MAKE`, `CC`, `PKG_CONFIG`, `GLIB_COMPILE_RESOURCES`, `BREW`, `CFLAGS`, `CPPFLAGS`, and `LDFLAGS` can customize
+the build. GNU Make and `pkg-config`/`pkgconf` are checked explicitly.
+
+Each installation rebuilds against the current machine's libraries, checks
+the binary's `--version` without opening a window, and validates the desktop
+launcher when the validator is available. Normal installations do not treat
+new compiler/deprecation warnings as errors; development builds can opt into
+`CFLAGS='-O2 -Wall -Wextra -Werror'`. Verified files replace their destinations
+atomically, so updating does not interrupt a running terminal. The executable
+includes white (`#ffffff`) on black defaults; clean installations use
+them without a settings file. Saved preferences and shared dependencies are
+retained on uninstall.
+
+## Behavior
+
+- Native File, Edit, View, Search, Terminal, and Help menus.
+- An 80×24 grid, the desktop monospace font, white text on black, a block cursor,
+  a scrollbar, and 10,000 lines of scrollback. Typing returns to the prompt;
+  incoming output leaves your scroll position alone when reading history.
+- Drag to select, double-click a word, triple-click a line. Selection uses
+  the PRIMARY clipboard; middle-click pastes it. Explicit Copy/Paste uses
+  the regular desktop clipboard. VTE handles rectangular selection,
+  bracketed paste, Unicode, ANSI colors, and terminal mouse reporting.
+- Right-click for Copy, Copy as HTML, Paste, Select All, Read-Only, New Window,
+  Show Menubar, Full Screen, and Close Terminal. Hold Shift while
+  right-clicking or selecting inside an app that captures the mouse.
+- New windows inherit the current local working directory and environment.
+  Shell titles update the window title.
+- Find supports plain text, case matching, regular expressions, and wraparound.
+- Ctrl-click URLs or use Open Link/Copy Link Address in their context menu.
+- Closing a window immediately ends its terminal session.
+  Exiting a shell or command closes its window. Failed launches stay visible
+  with the error so they can be diagnosed.
+
+| Action | Shortcut |
+| --- | --- |
+| New window | Ctrl+Shift+N |
+| Close window | Ctrl+Shift+W or Ctrl+Shift+Q |
+| Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
+| Find / next / previous | Ctrl+Shift+F / Ctrl+Shift+G / Ctrl+Shift+H |
+| Clear search | Ctrl+Shift+J |
+| Zoom in / out / normal | Ctrl+plus / Ctrl+minus / Ctrl+0 |
+| Full screen toggle | Super+Ctrl+Shift or F11 |
+| Preferences | Ctrl+, |
+
+Press Super, Ctrl, and Shift together without a letter key to enter full
+screen; release them and press the same chord again to leave full screen.
+
+Ctrl+Shift+C with no terminal selection sends a distinct modified key to
+raw-mode applications such as Simplenote, where it copies the whole note.
+At a shell prompt or in Read-Only mode it does nothing.
+Ctrl+C continues to interrupt the foreground command. Terminal scrolling
+shortcuts and mouse selection come from VTE, the terminal engine.
+
+## Preferences
+
+Open **Edit → Preferences**, choose **Preferences** from the terminal's
+right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
+
+- **Text:** initial columns/rows, custom font, cell spacing, blinking text,
+  cursor shape/blinking, and the terminal bell. Unchecking Custom font follows
+  the desktop monospace font, including live changes to that font. The disabled
+  font button shows the font currently in use. Systems without the desktop font
+  settings use Monospace 12. Reset buttons restore the initial size or spacing.
+- **Colors:** system theme colors or built-in text/background schemes, including
+  **Simpleterm** for white (`#ffffff`) text on black (`#000000`) with a green
+  (`#0ef65a`) Bash handle and directory, the GNOME palette, and automatic
+  bold/cursor/highlight colors. **White on black** changes only text and background,
+  and **Green on black** for bright green (`#0ef65a`) text on black,
+  optional bold/cursor/highlight colors, background transparency/opacity,
+  GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
+  text. Transparency requires a compositor on the desktop. Opaque terminals
+  advertise an opaque window region to the compositor; transparent window
+  backgrounds are used only when transparency is enabled below full opacity.
+- **Scrolling:** scrollbar visibility, scrolling on output/keystroke/paste,
+  and a bounded or unlimited history.
+- **General:** whether new windows show their menubar. **Shortcuts** lists
+  the current keyboard bindings.
+
+The **Show Menubar** toggle in the View menu or right-click menu also saves
+your choice as the default for new windows and future launches. Command-line
+menubar options override that default for the launched window.
+
+Font, color, cursor, bell, and scrolling changes apply immediately to every
+open window and are saved automatically. Initial geometry and menubar
+defaults apply to new windows; command-line options override those defaults.
+Changing the scrollback limit can discard older history.
+
+Palette changes written by wallpaper-theme also update open windows, including
+ANSI prompt colors. No terminal restart is needed.
+
+On SimpleOS, **Use colors from system theme** restores the wallpaper's text,
+background, all 16 terminal colors, cursor, selection, and ANSI prompt colors.
+The color buttons display the colors in use. Unchecking it restores the saved
+manual terminal colors; choosing a built-in text/background scheme switches to
+manual colors directly. The selected scheme is saved, including **Simpleterm**
+and **White on black**, which share text/background values. The wallpaper's
+generated palette remains separate from manual changes. Other desktops use GTK
+theme colors and retain their saved terminal palette.
+
+The **Handle color** row in Default Profile → Colors changes both `user@host`
+and the working directory, including `~` at home, in the standard Bash prompt.
+Choose **Green on black** for the same `#0ef65a`
+green as the text scheme, **Hacker green** (`#8eff38`), **Original green**
+(`#26a269`), or a custom color. **Follow terminal palette** uses ANSI green
+for the handle and restores the directory's original ANSI color, so wallpaper
+theming can recolor both as usual. Fixed choices keep both at the selected color
+when the wallpaper changes. Text and cursor controls
+remain separate. Changes appear at the next prompt in Bash terminals opened
+with this version of Simpleterm.
+
+The handle picker shares `$XDG_CONFIG_HOME/prompt-color/color` with the
+`prompt-color` shell tool. Simpleterm loads your normal `.bashrc` and keeps
+existing prompt hooks. It does not require a Downloads folder or edit your
+shell configuration. Other shells and explicitly supplied commands retain
+their normal startup behavior. The standalone installer includes the Bash
+startup asset, and `simpleupdate --suite-only` installs it with Simpleterm.
+
+Settings live in `$XDG_CONFIG_HOME/simpleterm/settings.ini`, normally
+`~/.config/simpleterm/settings.ini`. Simpleterm creates this file on the first
+change. Missing or invalid values use built-in defaults. If saving fails,
+the panel reports the error and the changes remain active for the session.
+The panel currently shares one profile across all terminals.
+
+## Command line
+
+```sh
+simpleterm
+simpleterm --working-directory ~/writing
+simpleterm --geometry 100x30 --title Work
+simpleterm --maximize
+simpleterm --preferences
+simpleterm -- bash -lc 'printf "Hello\\n"; exec bash'
+simpleterm -e htop
+simpleterm --help
+```
+
+Commands after `--` or `-e` are executed directly with the supplied arguments;
+use an explicit shell when shell syntax is needed. By default Simpleterm runs
+`$SHELL` (or the account's shell) as an interactive, non-login shell. Each
+launch opens a separate window and forwards its directory and environment
+to an existing process when one is running. Simpleterm does not change the default terminal or
+modify shell startup files.
+
+## Development
+
+```sh
+make simpleterm
+make test-simpleterm
+make test-simpleterm-compat
+make test-simpleterm-platform
+make test-simpleterm-install
+```
+
+Tests additionally require Python 3, Xvfb, xdotool, Openbox, and `dbus-run-session`.
+They run in a private display and session bus. The C test harness exercises
+the GTK widgets, real mouse/keyboard events, clipboards, and shell PTYs.
+`test-simpleterm-compat` also runs the UI tests through the older-library
+context menu and atomic preference-saving paths. `test-simpleterm-platform`
+checks the native binary's CLI and performs a real staged installation and
+removal without a display.
+The separate installer tests need Python 3 and standard shell/file utilities.
+They use temporary directories and mocked package and authentication commands
+to cover all ten package-manager branches, both Homebrew prefixes, staging,
+updates, uninstall, dependency failures, privilege handling, and preservation
+of unrelated macOS applications. Mocked platform checks verify installer
+behavior; they do not establish that a native binary works on that platform.
+Launcher regressions cover shared menu locations, safe removal, read-only
+compatibility directories, per-user KDE/macOS cache updates, validation of
+prebuilt installations, and migration to a real macOS application bundle.
+
+Behavior references: GNOME's [copy and paste guide](https://help.gnome.org/gnome-terminal/txt-copy-paste.html),
+[keyboard shortcuts](https://help.gnome.org/gnome-terminal/adv-keyboard-shortcuts.html),
+[VTE API](https://gnome.pages.gitlab.gnome.org/vte/gtk3/).
